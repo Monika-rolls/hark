@@ -32,7 +32,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import urllib.error
 import urllib.request
@@ -189,6 +189,44 @@ class Playhead(BaseModel):
     book: Optional[str] = None
     brevity: Optional[str] = None
     lookback: Optional[float] = None
+    tools_off: Optional[List[str]] = None
+
+
+# Every tool the agent can use, as the Settings page lists them. The passage
+# tool is the product itself, so it cannot be switched off; the rest can, per
+# listener. A switched-off tool is refused at its endpoint (cloud agent) and
+# routed to the passage instead (local pipeline).
+TOOL_CATALOG = [
+    ("passage_at_playhead", "What did that mean?", "Answers from what you just heard", True),
+    ("go_to_topic", "Jump to a topic", "Moves the audio to where something is discussed", False),
+    ("book_outline", "Overview", "What the whole title covers", False),
+    ("recap", "Recap", "Summarises the last few minutes", False),
+    ("explain_simply", "Explain simply", "Plain words and an everyday example", False),
+    ("translate", "Translate", "Explains it in another language", False),
+    ("quiz_me", "Quiz me", "Asks a question and marks your answer", False),
+    ("save_concept", "Remember this", "Saves the idea to your notes", False),
+    ("web_search", "Web search", "Looks things up on Google", False),
+]
+OPTIONAL_TOOLS = {tid for tid, _, _, always in TOOL_CATALOG if not always}
+
+
+def _set_tools_off(session_id: Optional[str], ids) -> None:
+    if not session_id:
+        return
+    off = sorted({str(i).strip() for i in (ids or [])} & OPTIONAL_TOOLS)
+    playheads.kv_set(f"hark:toolsoff:{session_id}", ",".join(off), ttl=6 * 3600)
+
+
+def _tools_off(session_id: Optional[str]) -> set:
+    raw = playheads.kv_get(f"hark:toolsoff:{session_id}") if session_id else None
+    return set(raw.split(",")) & OPTIONAL_TOOLS if raw else set()
+
+
+def _tool_off_reply(name: str) -> dict:
+    label = next((lbl for tid, lbl, _, _ in TOOL_CATALOG if tid == name), name)
+    return {"ok": False, "message": (
+        f"The listener has switched off '{label}' in Settings. Tell them in one "
+        f"sentence that it is off and can be turned back on in Settings.")}
 
 
 # How far back "what did that mean?" may look, chosen by the listener. The cap is
@@ -228,6 +266,8 @@ def report_playhead(p: Playhead):
         playheads.set_brevity(p.session_id, p.brevity)
     if p.lookback is not None:
         playheads.kv_set(f"hark:lookback:{p.session_id}", str(_clamp_lookback(p.lookback)), ttl=6 * 3600)
+    if p.tools_off is not None:
+        _set_tools_off(p.session_id, p.tools_off)
     # The same heartbeat carries jumps back. The agent cannot move the audio
     # itself -- it runs on AssemblyAI's servers -- so go_to_topic leaves a
     # pending position here and the browser collects it within the second.
@@ -525,6 +565,8 @@ def go_to_topic(call: TopicCall, request: Request):
     agent volunteering what is ahead; being asked to go there is consent.
     """
     sid = _tool_session(call.session_id, request)
+    if "go_to_topic" in _tools_off(sid):
+        return _tool_off_reply("go_to_topic")
     _note_tool(sid, "go_to_topic", {"topic": call.topic})
     return tool_go_to_topic(sid, call.topic)
 
@@ -572,6 +614,8 @@ def book_outline(call: OutlineCall, request: Request):
     us. The agent already has a language model; what it lacks is the text.
     """
     sid = _tool_session(call.session_id, request)
+    if "book_outline" in _tools_off(sid):
+        return _tool_off_reply("book_outline")
     _note_tool(sid, "book_outline", {})
     return tool_outline(sid)
 
@@ -727,6 +771,8 @@ def _learning_args(call: LearningCall) -> dict:
 @app.post("/tools/recap")
 def recap(call: LearningCall, request: Request):
     sid = _tool_session(call.session_id, request)
+    if "recap" in _tools_off(sid):
+        return _tool_off_reply("recap")
     _note_tool(sid, "recap", _learning_args(call))
     return tool_recap(sid, call.minutes)
 
@@ -734,6 +780,8 @@ def recap(call: LearningCall, request: Request):
 @app.post("/tools/explain_simply")
 def explain_simply(call: LearningCall, request: Request):
     sid = _tool_session(call.session_id, request)
+    if "explain_simply" in _tools_off(sid):
+        return _tool_off_reply("explain_simply")
     _note_tool(sid, "explain_simply", _learning_args(call))
     return tool_explain_simply(sid, call.style)
 
@@ -741,6 +789,8 @@ def explain_simply(call: LearningCall, request: Request):
 @app.post("/tools/translate")
 def translate(call: LearningCall, request: Request):
     sid = _tool_session(call.session_id, request)
+    if "translate" in _tools_off(sid):
+        return _tool_off_reply("translate")
     _note_tool(sid, "translate", _learning_args(call))
     return tool_translate(sid, call.language)
 
@@ -748,6 +798,8 @@ def translate(call: LearningCall, request: Request):
 @app.post("/tools/quiz_me")
 def quiz_me(call: LearningCall, request: Request):
     sid = _tool_session(call.session_id, request)
+    if "quiz_me" in _tools_off(sid):
+        return _tool_off_reply("quiz_me")
     _note_tool(sid, "quiz_me", _learning_args(call))
     return tool_quiz(sid, call.answer, call.question)
 
@@ -755,6 +807,8 @@ def quiz_me(call: LearningCall, request: Request):
 @app.post("/tools/save_concept")
 def save_concept(call: LearningCall, request: Request):
     sid = _tool_session(call.session_id, request)
+    if "save_concept" in _tools_off(sid):
+        return _tool_off_reply("save_concept")
     _note_tool(sid, "save_concept", _learning_args(call))
     return tool_save(sid, call.concept)
 
@@ -768,6 +822,8 @@ class WebSearchCall(BaseModel):
 def web_search(call: WebSearchCall, request: Request):
     """Look something up on the live web, for what the book cannot answer."""
     sid = _tool_session(call.session_id, request)
+    if "web_search" in _tools_off(sid):
+        return _tool_off_reply("web_search")
     _note_tool(sid, "web_search", {"query": call.query or ""})
     return tool_web_search(sid, call.query)
 
@@ -1078,6 +1134,8 @@ async def voice_socket(ws: WebSocket):
     await ws.accept()
     sid = ws.query_params.get("session_id")
     llm = ws.query_params.get("llm")
+    if ws.query_params.get("tools_off") is not None:
+        _set_tools_off(sid, ws.query_params.get("tools_off", "").split(","))
     # Allowlisted: an unknown voice is the default, never a URL to fetch.
     voice = tts_voice(ws.query_params.get("voice"))
     await ws.send_json({"type": "session.ready", "session_id": sid, "llm": llm,
@@ -1150,7 +1208,8 @@ async def voice_socket(ws: WebSocket):
                 continue
 
             quiz_key = f"hark:quiz:{sid}"
-            pending = playheads.kv_get(quiz_key) if sid else None
+            pending = (playheads.kv_get(quiz_key)
+                       if sid and "quiz_me" not in _tools_off(sid) else None)
             if pending and not QUIZ_CANCEL.search(text) and not QUIZ_AGAIN.search(text):
                 # They are answering the question Hark just asked.
                 name, args = "quiz_me", {"question": pending, "answer": text}
@@ -1159,6 +1218,9 @@ async def voice_socket(ws: WebSocket):
                 if pending:
                     playheads.kv_set(quiz_key, "", ttl=1)
                 name, args = await run_in_threadpool(local_voice.router.route, text)
+                if name in _tools_off(sid):
+                    print(f"[local] {name} is switched off; answering from the passage")
+                    name, args = "passage_at_playhead", {}
             # The router picks web_search but may leave the query out; the
             # question itself is the best query then.
             if name == "web_search" and not str((args or {}).get("query", "")).strip():
@@ -1499,6 +1561,8 @@ def health():
             "voice_provider": VOICE_PROVIDER,
             "local_models": local_voice.status(),
             "tts_voices": [{"id": k, "label": v} for k, v in TTS_VOICES.items()],
+            "tools": [{"id": tid, "label": lbl, "description": desc, "always_on": always}
+                      for tid, lbl, desc, always in TOOL_CATALOG],
             "tts_voice_default": DEFAULT_TTS_VOICE,
             "vad": "silero" if vad_enabled() else "energy",
             "local_llms": local_llm.available_llms()}
