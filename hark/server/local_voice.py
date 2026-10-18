@@ -54,9 +54,12 @@ CONTENTLESS = {
     "thanks", "thank you", "hello", "hi", "hey", "so", "well", "like", "i see",
 }
 
-# One model per process, and none of the three is thread-safe. Every call into
-# them goes through this lock.
+# One model per process, and none of them is thread-safe. Whistle and Needle run
+# on the same Cactus engine, so they share a lock; PocketTTS (torch) has its own.
+# It used to be one lock for all three -- and since speaking holds it for a whole
+# reply, one stuck reply meant no one could be heard again.
 _MODEL_LOCK = threading.RLock()
+_TTS_LOCK = threading.RLock()
 
 
 def resample(x: np.ndarray, src: int, dst: int) -> np.ndarray:
@@ -193,7 +196,10 @@ class Endpointer:
 
         self._frames.append(frame)
         self._quiet_run = self._quiet_run + n if not hot else 0
-        if hot:
+        # Counted on the detector alone: the soft ends of words fall under the
+        # loudness gate, and counting only loud *and* voiced frames dropped short
+        # commands ("Please quiz me." measured 0.26 s of a 1.1 s turn).
+        if voiced:
             self._voiced_run += n
         total = sum(len(f) for f in self._frames)
         if self._quiet_run >= self._hangover_samples or total >= self._max_samples:
@@ -604,7 +610,7 @@ class PocketTtsSpeaker:
         self._load()
         voice = tts_voice(voice) if voice else self._voice
         if voice not in self._states:
-            with _MODEL_LOCK:
+            with _TTS_LOCK:
                 self._states[voice] = self._model.get_state_for_audio_prompt(voice)
         return self._states[voice]
 
@@ -615,7 +621,7 @@ class PocketTtsSpeaker:
             return b""
         model = self._load()
         state = self._voice_state(voice)
-        with _MODEL_LOCK:
+        with _TTS_LOCK:
             audio = model.generate_audio(state, text)
         samples = _tensor_to_numpy(audio)
         if self._rate != WIRE_RATE:
@@ -634,7 +640,7 @@ class PocketTtsSpeaker:
             return
         model = self._load()
         state = self._voice_state(voice)
-        with _MODEL_LOCK:
+        with _TTS_LOCK:
             for chunk in model.generate_audio_stream(state, text):
                 samples = _tensor_to_numpy(chunk)
                 if self._rate != WIRE_RATE:

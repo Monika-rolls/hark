@@ -81,7 +81,10 @@ class GeminiAnswer:
             return None
         if GeminiAnswer._client is None:
             from google import genai
-            GeminiAnswer._client = genai.Client(api_key=key)
+            from google.genai import types
+            # A stalled request must not hold a spoken reply open forever.
+            GeminiAnswer._client = genai.Client(
+                api_key=key, http_options=types.HttpOptions(timeout=30_000))
         return GeminiAnswer._client
 
     def stream(self, prompt: str, system: str) -> Iterator[str]:
@@ -227,8 +230,9 @@ def _grounding_client():
         return GeminiAnswer()._client_or_none()
     if _search_client is None:
         from google import genai
+        from google.genai import types
         _search_client = genai.Client(
-            vertexai=True, project=project,
+            vertexai=True, project=project, http_options=types.HttpOptions(timeout=30_000),
             location=os.getenv("HARK_VERTEX_LOCATION", "global").strip() or "global")
     return _search_client
 

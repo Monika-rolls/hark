@@ -684,7 +684,7 @@ def tool_recap(session_id: Optional[str], minutes=None) -> dict:
     err, t, text = _heard(session_id, minutes * 60)
     if err:
         return err
-    return {"ok": True, "message": (
+    return {"ok": True, "passage": text, "message": (
         f"RECAP of the last {minutes:g} minutes, up to {_clock(t)}:\n{text}\n\n"
         f"Recap what they heard, in order, in three or four short spoken sentences. "
         f"Lead with the main idea. Nothing after {_clock(t)}.")}
@@ -697,7 +697,7 @@ def tool_explain_simply(session_id: Optional[str], style=None) -> dict:
         return err
     how = ("with one concrete example" if str(style or "").lower().startswith("ex")
            else "as if to a curious twelve-year-old, with one everyday analogy")
-    return {"ok": True, "message": (
+    return {"ok": True, "passage": text, "message": (
         f"What they just heard (up to {_clock(t)}):\n{text}\n\n"
         f"Explain the main idea of this simply, {how}. No jargon: if a technical "
         f"word is unavoidable, define it in passing. Three short sentences at most.")}
@@ -711,7 +711,7 @@ def tool_translate(session_id: Optional[str], language=None) -> dict:
     err, t, text = _heard(session_id, _lookback(session_id))
     if err:
         return err
-    return {"ok": True, "language": language, "message": (
+    return {"ok": True, "language": language, "passage": text, "message": (
         f"What they just heard (up to {_clock(t)}):\n{text}\n\n"
         f"Explain what this passage says, in {language}. Write the whole answer in "
         f"{language}, in its usual script, in two or three simple sentences. "
@@ -724,13 +724,13 @@ def tool_quiz(session_id: Optional[str], answer=None, question=None) -> dict:
     if err:
         return err
     if answer and question:
-        return {"ok": True, "message": (
+        return {"ok": True, "passage": text, "message": (
             f"What they heard (up to {_clock(t)}):\n{text}\n\n"
             f"QUIZ. You asked: {question}\nThey answered: {answer}\n\n"
             f"Tell them whether that is right, in one or two sentences. If it is "
             f"wrong or partly right, give the correct answer from the passage. "
             f"Then ask if they want another question.")}
-    return {"ok": True, "message": (
+    return {"ok": True, "passage": text, "message": (
         f"What they heard (up to {_clock(t)}):\n{text}\n\n"
         f"QUIZ. Ask them ONE short question that checks they understood the key "
         f"idea here -- not a trivia detail. Say only the question, then stop and "
@@ -745,7 +745,7 @@ def tool_save(session_id: Optional[str], concept=None) -> dict:
     concept = str(concept or "").strip()[:120]
     snippet = text[-300:]
     snippet = snippet[snippet.find(" ") + 1:] if len(text) > 300 else snippet
-    return {"ok": True,
+    return {"ok": True, "passage": "Saved to your notes: " + snippet,
             "note": {"at": round(t, 1), "concept": concept, "text": snippet},
             "message": (
                 f"SAVED to their notes at {_clock(t)}"
@@ -846,7 +846,7 @@ def tool_web_search(session_id: Optional[str], query: Optional[str]) -> dict:
             "Web search is not available right now. Say you could not check online, "
             "and answer from the book if it covers the question.")}
     names = ", ".join(t for t, _ in found["sources"][:3]) or "the web"
-    return {"ok": True, "message": (
+    return {"ok": True, "passage": "From the web: " + found["text"], "message": (
         f"Google Search results for \"{query}\":\n{found['text']}\n\n"
         f"Sources: {names}\n\n"
         f"Answer from these results, and say it comes from the web, not the book "
@@ -988,8 +988,9 @@ def _fallback_answer(tool_result: dict) -> str:
     broken read aloud.
     """
     message = tool_result.get("message", "") or ""
-    passage = ""
-    if "just heard" in message:
+    # Tools that wrap the passage in instructions hand it over separately.
+    passage = (tool_result.get("passage") or "").strip()
+    if not passage and "just heard" in message:
         after = message.split("just heard", 1)[1]
         passage = after.split(":", 1)[1] if ":" in after else after
         passage = passage.split(chr(10) + chr(10), 1)[0].strip()
@@ -1051,7 +1052,7 @@ PARTIAL_INTERVAL_S = 1.0
 PARTIAL_MIN_S = 1.1
 # Less voiced audio than this in a turn is not a question (only checked when
 # Silero is gating; loudness alone cannot tell).
-MIN_VOICED_S = 0.3
+MIN_VOICED_S = 0.25
 
 
 async def _partial_transcript(ws: WebSocket, endpointer, generation: int,
@@ -1177,23 +1178,30 @@ async def voice_socket(ws: WebSocket):
                   f"({len(audio16) / STT_RATE:.1f}s at 16k)")
             # Too short to be a question: a click, a cough, or a consonant burst
             # from the speakers. Transcribing it just invites a hallucination.
+            # Every way out below closes the turn with reply.done: the page shows
+            # "Thinking" from speech.stopped until it hears back, and a silent
+            # drop left it there for good.
             if len(audio16) < MIN_UTTERANCE_S * STT_RATE:
                 print("[local] dropped: too short")
+                await ws.send_json({"type": "reply.done", "status": "dropped"})
                 continue
             # Long enough, but mostly not a voice: a fan, a door, the TV. Whistle
             # would put words to it anyway.
             if endpointer.gated and endpointer.last_voiced_s < MIN_VOICED_S:
                 print(f"[local] dropped: only {endpointer.last_voiced_s:.2f}s of speech")
+                await ws.send_json({"type": "reply.done", "status": "dropped"})
                 continue
             text = (await run_in_threadpool(local_voice.stt.transcribe, audio16) or "").strip()
             print(f"[local] heard: {text!r}")
             if not text:
+                await ws.send_json({"type": "reply.done", "status": "dropped"})
                 continue
             # Whisper-family models answer noise with a handful of stock phrases
             # ("Thank you.", "Thanks for watching"). On a short clip, one of those
             # is the model filling in, not the listener talking.
             if len(audio16) < 1.6 * STT_RATE and text.lower().strip(" .,!?") in HALLUCINATIONS:
                 print(f"[local] dropped a likely hallucination: {text!r}")
+                await ws.send_json({"type": "reply.done", "status": "dropped"})
                 continue
             await ws.send_json({"type": "transcript.user", "text": text})
 
@@ -1225,6 +1233,8 @@ async def voice_socket(ws: WebSocket):
             # question itself is the best query then.
             if name == "web_search" and not str((args or {}).get("query", "")).strip():
                 args = {**(args or {}), "query": text}
+            print(f"[local] tool: {name} {args}")
+            started = time.monotonic()
             result = await run_in_threadpool(run_local_tool, sid, name, args)
             # Show what the agent decided to do, before the answer. In the cloud
             # path the same thing rides the heartbeat, because AssemblyAI calls
@@ -1238,6 +1248,8 @@ async def voice_socket(ws: WebSocket):
             holder = {"text": "", "fallback": _fallback_answer(result)}
             sentences = local_answer_stream(text, result.get("message", ""), llm)
             await _stream_reply(ws, sentences, holder, voice)
+            print(f"[local] answered in {time.monotonic() - started:.1f}s "
+                  f"({len(holder['text'])} chars)")
             if name == "quiz_me" and not args.get("answer") and holder["text"] and sid:
                 # Remember the question, so the next thing they say is marked.
                 playheads.kv_set(f"hark:quiz:{sid}", holder["text"][:400], ttl=QUIZ_TTL_S)

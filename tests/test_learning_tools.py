@@ -125,3 +125,25 @@ def test_local_quiz_marks_the_next_utterance_and_save_tells_the_page(monkeypatch
     assert calls[1] == ("quiz_me", {"question": "What links x and y?", "answer": "a function of x"})
     assert calls[2][0] == "save_concept"
     assert any(e["type"] == "note.saved" and e["at"] == 12.0 for e in events)
+
+
+def test_without_a_model_the_fallback_reads_the_passage_not_the_instructions(at_ten_minutes):
+    for out in (main.tool_quiz(at_ten_minutes), main.tool_recap(at_ten_minutes),
+                main.tool_translate(at_ten_minutes, "Hindi")):
+        spoken = main._fallback_answer(out)
+        assert spoken.startswith("From the book:")
+        for instruction in ("Ask them", "Recap what", "Explain what", "ONE short"):
+            assert instruction not in spoken
+
+
+def test_a_dropped_utterance_still_ends_the_turn(monkeypatch):
+    # The page shows "Thinking" from speech.stopped until reply.done; a silent
+    # drop used to leave it there.
+    monkeypatch.setenv("HARK_STT_PARTIALS", "0")
+    monkeypatch.setenv("HARK_STT_VAD", "0")
+    monkeypatch.setattr(main.local_voice.stt, "transcribe", lambda audio: "")
+    with TestClient(main.app).websocket_connect("/ws/voice?session_id=sDrop") as ws:
+        ws.receive_json()
+        _say(ws)
+        kinds = [ws.receive_json()["type"] for _ in range(3)]
+    assert kinds == ["input.speech.started", "input.speech.stopped", "reply.done"]
