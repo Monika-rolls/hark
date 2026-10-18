@@ -91,3 +91,13 @@ def test_the_hosting_message_says_what_does_work():
     except books.RejectedURL as exc:
         assert "archive.org" in str(exc).lower()
         assert ".mp3" in str(exc)
+
+
+def test_a_youtube_link_hears_why_even_without_a_key(monkeypatch):
+    # The page-not-file explanation must win over "no key on this server".
+    from fastapi.testclient import TestClient
+    from hark.server import main
+    monkeypatch.setattr(main, "AAI_KEY", "")
+    monkeypatch.setattr(main, "ACCESS_CODE", "")
+    r = TestClient(main.app).post("/api/books", json={"audio_url": "https://www.youtube.com/watch?v=abc"})
+    assert r.status_code == 400 and "web page, not an audio file" in r.json()["detail"]

@@ -1462,8 +1462,6 @@ def add_book(new: NewBook, request: Request):
     killed by the platform long before it finished.
     """
     _require_code(request)
-    if not AAI_KEY:
-        raise HTTPException(500, "ASSEMBLYAI_API_KEY is not set on this deployment.")
     urls = [u.strip() for u in (new.audio_urls or [new.audio_url]) if u and u.strip()]
     if not urls:
         raise HTTPException(400, "No audio link given.")
@@ -1477,6 +1475,11 @@ def add_book(new: NewBook, request: Request):
         # one bad link in chapter nine should fail now, not in ten minutes.
         for u in urls:
             books.check_source(u, int(MAX_SOURCE_MB * 1_000_000))
+        # After the link check: a YouTube page should hear why it can't work,
+        # not that this server is missing a key.
+        if not AAI_KEY:
+            raise HTTPException(503, "Adding books needs transcription, which isn't "
+                                     "set up on this server yet (ASSEMBLYAI_API_KEY).")
         _rate_limit(request)
         rec = books.create(playheads, new.title or _title_from_url(urls[0]), urls,
                            AAI_KEY, _client_id(request))
