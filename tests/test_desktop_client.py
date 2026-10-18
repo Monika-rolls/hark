@@ -1,6 +1,11 @@
 """Offline checks that need no API key and no speakers."""
 import time
 import numpy as np
+import pytest
+
+# CI installs requirements.txt + pytest only, not soundfile/sounddevice.
+pytest.importorskip("soundfile")
+pytest.importorskip("sounddevice")
 import soundfile as sf
 
 from hark.core.player import AudiobookPlayer
