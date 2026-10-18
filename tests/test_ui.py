@@ -568,3 +568,36 @@ def test_the_local_engine_saves_from_its_own_event(page):
     page.wait_for_function("notes.length === 1")
     assert page.evaluate("notes[0].t") == 5
 
+
+def test_tools_switched_off_are_remembered_and_sent(page):
+    """Off in Settings means off on the heartbeat, on the socket and in the hints."""
+    page.click("#settingsbtn")
+    page.wait_for_selector("#toolswrap:not([hidden])")
+    assert page.is_disabled("#toollist input[data-tool='passage_at_playhead']")
+    assert page.is_checked("#toollist input[data-tool='web_search']")
+    page.click("#voiceengine button[data-engine='local']")
+    page.locator("#toollist input[data-tool='web_search']").click()
+    assert not page.is_checked("#toollist input[data-tool='web_search']")
+    page.click("#settingsclose")
+
+    assert page.evaluate("JSON.parse(localStorage.getItem('hark:toolsOff'))") == ["web_search"]
+    assert page.locator(".says li[data-tool='web_search']").get_attribute("hidden") is not None
+    assert page.locator(".says li[data-tool='quiz_me']").get_attribute("hidden") is None
+
+    page.click("#start")
+    page.wait_for_function("window.__ws !== undefined")
+    assert "tools_off=web_search" in page.evaluate("window.__ws.url")
+    Handler.playhead_calls = []
+    page.evaluate("window.__agent({type:'session.ready', session_id:'s1'})")
+    page.wait_for_function("live === true")
+    page.evaluate("reportPlayhead()")
+    page.wait_for_timeout(250)
+    assert Handler.playhead_calls and Handler.playhead_calls[-1]["tools_off"] == ["web_search"]
+
+    # Survives a reload.
+    page.reload()
+    page.wait_for_function("document.getElementById('book').readyState >= 1")
+    page.click("#settingsbtn")
+    page.wait_for_selector("#toolswrap:not([hidden])")
+    assert not page.is_checked("#toollist input[data-tool='web_search']")
+

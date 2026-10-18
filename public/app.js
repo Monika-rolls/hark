@@ -410,6 +410,7 @@ async function reportPlayhead() {
         book: currentBook ? currentBook.id : null,
         brevity,
         lookback,
+        tools_off: toolsOff,
       }),
     });
     // The reply can carry a jump. go_to_topic runs on AssemblyAI's servers and
@@ -683,6 +684,12 @@ let localLlms = null;
 // Which voice reads the answers in local mode. The server lists what it has in
 // /api/health; an id it does not know falls back to its default.
 let ttsVoice = storageGet("hark:voice", null);
+// Tools the listener switched off. Stored as the off list so a tool the
+// server adds later is on by default.
+let toolsOff = (() => {
+  const v = storageGet("hark:toolsOff", []);
+  return Array.isArray(v) ? v.filter((x) => typeof x === "string") : [];
+})();
 // Which engine the *running* session actually uses. The toggle only decides the
 // next session -- changing it while listening does not switch the voice you are
 // already hearing -- so the status line reports this, not the toggle.
@@ -757,6 +764,7 @@ function buildVoiceProvider() {
     localModels = h.local_models || null;
     localLlms = h.local_llms || null;
     buildVoices(h.tts_voices, h.tts_voice_default);
+    buildTools(h.tools);
     applyVoiceProvider(voiceProvider || h.voice_provider || "assemblyai");
   }).catch(() => applyVoiceProvider(voiceProvider || "assemblyai"));
 }
@@ -779,6 +787,47 @@ function buildVoices(voices, fallback) {
   ttsVoice = pick;
   sel.disabled = voiceProvider !== "local";
   wrap.hidden = false;
+}
+
+function buildTools(tools) {
+  const wrap = el("toolswrap");
+  const list = el("toollist");
+  if (!wrap || !list) return;
+  if (!Array.isArray(tools) || !tools.length) { wrap.hidden = true; return; }
+  list.textContent = "";
+  tools.forEach((t) => {
+    const row = document.createElement("label");
+    row.className = "switch";
+    const name = document.createElement("b");
+    name.textContent = t.label || t.id;
+    const desc = document.createElement("small");
+    desc.textContent = t.always_on ? (t.description || "") + " Always on." : (t.description || "");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.setAttribute("role", "switch");
+    box.dataset.tool = t.id;
+    box.checked = t.always_on || !toolsOff.includes(t.id);
+    box.disabled = !!t.always_on;
+    box.addEventListener("change", () => {
+      toolsOff = toolsOff.filter((id) => id !== t.id);
+      if (!box.checked) toolsOff.push(t.id);
+      storageSet("hark:toolsOff", toolsOff);
+      applyToolsOff();
+      // The heartbeat carries it, so the next question already obeys.
+      reportPlayhead();
+    });
+    row.append(name, box, desc);
+    list.appendChild(row);
+  });
+  wrap.hidden = false;
+  applyToolsOff();
+}
+
+// Don't suggest phrases for a tool that is switched off.
+function applyToolsOff() {
+  document.querySelectorAll(".says li[data-tool]").forEach((li) => {
+    li.hidden = toolsOff.includes(li.dataset.tool);
+  });
 }
 
 function warmLocal() {
@@ -1803,7 +1852,8 @@ async function start() {
     warmLocal();
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const path = session.ws_path || "/ws/voice";
-    const voiceParam = ttsVoice ? `&voice=${encodeURIComponent(ttsVoice)}` : "";
+    const voiceParam = (ttsVoice ? `&voice=${encodeURIComponent(ttsVoice)}` : "")
+      + (toolsOff.length ? `&tools_off=${encodeURIComponent(toolsOff.join(","))}` : "");
     ws = new WebSocket(`${proto}//${location.host}${path}?session_id=${encodeURIComponent(session.session_id)}&llm=${encodeURIComponent(answerModel || "gemini")}${voiceParam}`);
     ws.onopen = () => {
       debug("local voice socket open");
@@ -2169,6 +2219,7 @@ function clearConversation() {
 }
 
 migrateOldKeys();
+applyToolsOff();
 buildSpeeds();
 buildAnswerMode();
 buildBrevity();

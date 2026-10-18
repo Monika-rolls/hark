@@ -146,7 +146,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._send({"ok": True, "voice_provider": "assemblyai",
                                "tts_voices": [{"id": "alba", "label": "Alba"},
                                               {"id": "marius", "label": "Marius"}],
-                               "tts_voice_default": "alba"})
+                               "tts_voice_default": "alba",
+                               "tools": [
+                                   {"id": "passage_at_playhead", "label": "What you just heard",
+                                    "description": "Reads the passage at the playhead", "always_on": True},
+                                   {"id": "web_search", "label": "Web search",
+                                    "description": "Look things up on Google", "always_on": False},
+                                   {"id": "quiz_me", "label": "Quiz me",
+                                    "description": "Questions on what you heard", "always_on": False},
+                               ]})
         if path == "/api/session":
             if "provider=local" in self.path:
                 return self._send({"provider": "local", "session_id": "s1",
