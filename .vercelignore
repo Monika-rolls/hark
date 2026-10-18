@@ -1,3 +1,17 @@
+# Never upload keys; Vercel gets them as project environment variables.
+.env
+.env.*
+!.env.example
+# Local-only weights, scratch audio and the Cloud Run image files.
+/models/
+/checkpoints/
+/*.mp3
+*.log
+data/podcast-32k.*
+Dockerfile
+.dockerignore
+.gcloudignore
+requirements-cloudrun.txt
 .venv/
 /audio/
 __pycache__/
