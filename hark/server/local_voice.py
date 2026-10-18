@@ -37,13 +37,15 @@ STT_RATE = 16000
 MAX_UTTERANCE_S = 28.0
 # Anything shorter than this is a cough, a key click, or a click from the
 # speakers -- not a question. Transcribing it invites a hallucination.
-MIN_UTTERANCE_S = 0.55
+MIN_UTTERANCE_S = 0.8
 # Whisper-family models emit these on noise or near-silence. A short clip that
 # comes back as one of them is the model filling in, not the listener talking.
 HALLUCINATIONS = {
     "thank you", "thanks", "thank you very much", "thanks a lot", "thank you.",
     "thanks for watching", "thank you for watching", "thanks for watching!",
     "please subscribe", "subscribe", "you", "bye", "goodbye", "okay", "ok",
+    "the", "a", "uh", "um", "hmm", "mm", "ah", "oh", "yeah", "you know",
+    "subtitles by", "whisper", "music", "applause", "laughter",
 }
 # Fillers and acknowledgements. They are worth showing (the listener sees their
 # words) but not worth answering: there is no question in them, and a small
@@ -115,7 +117,7 @@ class Endpointer:
         self,
         rate: int = WIRE_RATE,
         threshold_ratio: float = 4.0,
-        min_trigger_rms: float = 0.004,
+        min_trigger_rms: float = 0.01,
         attack_s: Optional[float] = None,
         silence_s: Optional[float] = None,
         max_seconds: float = MAX_UTTERANCE_S,
@@ -126,7 +128,7 @@ class Endpointer:
         if silence_s is None:
             silence_s = float(os.getenv("HARK_STT_SILENCE_MS", "450") or 450) / 1000.0
         if attack_s is None:
-            attack_s = float(os.getenv("HARK_STT_ATTACK_MS", "150") or 150) / 1000.0
+            attack_s = float(os.getenv("HARK_STT_ATTACK_MS", "280") or 280) / 1000.0
         self.rate = rate
         self._ratio = threshold_ratio
         self._min_trigger = min_trigger_rms
@@ -231,7 +233,7 @@ class SpeechDetector:
 
     CHUNK = 512  # 32 ms at 16 kHz, the window Silero is trained on
 
-    def __init__(self, on: float = 0.5, off: float = 0.35):
+    def __init__(self, on: float = 0.6, off: float = 0.4):
         from silero_vad import load_silero_vad
         self._model = load_silero_vad()
         self._on = on

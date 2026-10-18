@@ -33,8 +33,8 @@ def test_a_quiet_room_opens_no_turn():
 
 
 def test_a_sustained_burst_opens_then_closes_a_turn():
-    # Three hot frames is the attack; a run of quiet past the hangover ends it.
-    events = _feed(Endpointer(RATE), _quiet(20) + _speech(5) + _quiet(20))
+    # A few hot frames is the attack; a run of quiet past the hangover ends it.
+    events = _feed(Endpointer(RATE), _quiet(20) + _speech(8) + _quiet(20))
     assert events == ["start", "end"]
 
 
@@ -65,7 +65,7 @@ def test_the_endpointer_exposes_the_turn_for_a_live_partial():
     for _ in range(10):
         ep.feed(np.zeros(FRAME, np.float32))
     started = None
-    for _ in range(4):
+    for _ in range(8):
         started = ep.feed(np.full(FRAME, 0.05, np.float32))
         if started:
             break

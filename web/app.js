@@ -25,6 +25,7 @@ const startBtn = el("start");
 let ws, session, micCtx, micNode, micStream, outCtx, playCursor = 0;
 let agentSpeaking = false, framesSent = 0, justSeeked = false;
 let scheduled = [];   // agent audio already queued on the device
+let resumeTimer = null; // wait until spoken audio has actually drained
 let heartbeat = null; // the once-a-second playhead report
 let live = false;     // a session is up and the microphone is open
 
@@ -54,6 +55,7 @@ const COMMANDS = [
       `^\\W*${RESUME_WORD}(?:[\\s,.!]+${RESUME_WORD})*[\\s.!,]*$`, "i"),
     run: () => {
       flushReply();
+      agentSpeaking = false;
       resumeBook();
       setStatus("listening - just talk", "live");
       debug("command: carry on");
@@ -63,6 +65,7 @@ const COMMANDS = [
     match: /^\W*(?:go back|back up|rewind|skip back)(?: a bit| a little)?[\s.!,]*$/i,
     run: () => {
       flushReply();
+      agentSpeaking = false;
       seek(pos() - 30);
       resumeBook();
       turn("hark", "Back 30 seconds", "system");
@@ -371,20 +374,51 @@ function seek(t) {
 
 // ---------- the book ----------
 
+function cancelPendingResume() {
+  if (resumeTimer) { clearTimeout(resumeTimer); resumeTimer = null; }
+}
+
+function replyStillPlaying() {
+  // reply.done means the last chunk was *sent*, not that the speakers are
+  // silent. Chunks are scheduled into the future on outCtx.
+  if (scheduled.length) return true;
+  if (!outCtx) return false;
+  return playCursor > outCtx.currentTime + 0.02;
+}
+
+function finishAnswerThenResume() {
+  // Hold the book until queued TTS has drained, otherwise the podcast and
+  // the answer talk over each other for the last sentence or two.
+  cancelPendingResume();
+  const go = () => {
+    resumeTimer = null;
+    agentSpeaking = false;
+    resumeBook();
+    setPlayIcon(true);
+    liveStatus();
+  };
+  if (!replyStillPlaying()) { go(); return; }
+  const waitMs = Math.ceil((playCursor - outCtx.currentTime) * 1000) + 80;
+  resumeTimer = setTimeout(go, Math.max(80, waitMs));
+}
+
 function pauseBook() {
   // The book never plays under a voice. It is paused the moment either side
   // starts talking and stays paused until the agent has finished, so the two
   // can never speak over each other. ("Keep it playing, quietly" used to be an
   // option; two voices at once was worse than losing the thread of the book.)
+  cancelPendingResume();
   book.pause();
+  book.volume = 0;
   document.body.classList.add("listening");
 }
 
 function resumeBook() {
+  // A resume request that lands while the agent is speaking (or while its
+  // audio is still queued) is ignored: the book comes back when the answer
+  // is actually silent, not on a stray tap or an early reply.done.
+  if (agentSpeaking || replyStillPlaying()) return;
   unduck();
-  // A resume request that lands while the agent is speaking is ignored: the
-  // book comes back when the answer is done, not on a stray tap.
-  if (agentSpeaking) return;
   if (book.paused) book.play().catch(() => {});
 }
 
@@ -516,7 +550,7 @@ function renderMarks() {
       // Deliberate, like a chapter jump: if this happens while an answer is
       // running, do not undo it with the usual three-second rewind.
       justSeeked = true;
-      book.play().catch(() => {});
+      if (!agentSpeaking) book.play().catch(() => {});
     });
     holder.appendChild(b);
   });
@@ -884,7 +918,7 @@ function renderContents() {
     b.addEventListener("click", () => {
       seek(c.t);
       justSeeked = true;
-      book.play().catch(() => {});
+      if (!agentSpeaking) book.play().catch(() => {});
     });
     li.appendChild(b);
     list.appendChild(li);
@@ -1641,7 +1675,7 @@ async function startMic() {
     audio: {
       echoCancellation: true,
       noiseSuppression: true,
-      autoGainControl: true,
+      autoGainControl: false,
       sampleRate: RATE,
       channelCount: 1,
     },
@@ -1698,6 +1732,7 @@ function playReply(b64) {
 }
 
 function flushReply() {
+  cancelPendingResume();
   scheduled.forEach((n) => { try { n.stop(); } catch (_) { /* already done */ } });
   scheduled = [];
   playCursor = 0;
@@ -1761,6 +1796,7 @@ function stopSession() {
     try { ws.close(); } catch (_) { /* already closing */ }
     ws = null;
   }
+  cancelPendingResume();
   flushReply();
   releaseAgent();
   session = null;
@@ -2034,9 +2070,7 @@ async function start() {
         // the reason for choosing that mode.
         if (justSeeked) justSeeked = false;
         else if (answerMode === "pause") seek(pos() - 3);
-        resumeBook();
-        setPlayIcon(true);
-        liveStatus();
+        finishAnswerThenResume();
         break;
 
       case "error":
