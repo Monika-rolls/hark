@@ -216,7 +216,12 @@ def test_resume_clicked_immediately_still_seeks(page):
 # --------------------------------------------------------------------------
 
 def test_handshake_nests_the_agent_id(page):
-    """Sent flat, the socket still says ready and no agent ever loads."""
+    """Sent flat, the socket still says ready and no agent ever loads.
+
+    The agent is no longer offered in the UI; ?engine=assemblyai still reaches it.
+    """
+    page.goto(page.url.split("?")[0] + "?engine=assemblyai")
+    page.wait_for_function("document.getElementById('book').readyState >= 1")
     start_session(page)
     sent = [json.loads(s) for s in page.evaluate("window.__sent")]
     update = next(s for s in sent if s["type"] == "session.update")
@@ -517,7 +522,7 @@ def test_the_chosen_voice_reaches_the_local_socket(page):
     """Voice is a local-engine setting: offered from /api/health, sent on the socket."""
     page.click("#settingsbtn")
     page.wait_for_selector("#voicewrap:not([hidden])")
-    assert page.is_disabled("#voice"), "the cloud agent has its own voice"
+    assert not page.query_selector("#voiceengine button[data-engine='assemblyai']"),         "the AssemblyAI agent is not offered in the UI"
     page.click("#voiceengine button[data-engine='local']")
     assert page.is_enabled("#voice")
     page.select_option("#voice", "marius")

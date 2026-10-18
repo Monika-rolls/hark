@@ -687,9 +687,10 @@
       <h3>Voice engine</h3>
       <p class="muted">Applies the next time you tap &ldquo;Enable asking questions&rdquo;.</p>
       <div class="choice" id="voiceengine" role="radiogroup" aria-label="Which voice engine answers">
-        <button type="button" data-engine="assemblyai" role="radio" aria-checked="true">Cloud<small>AssemblyAI voice agent</small></button>
+        <!-- The AssemblyAI agent is still served (/api/session?provider=assemblyai)
+             but no longer offered here: Google and Local cover it. -->
+        <button type="button" data-engine="google" role="radio" aria-checked="true">Google<small>Chirp speech, Gemini, Chirp HD voices</small></button>
         <button type="button" data-engine="local" role="radio" aria-checked="false">Local<small>Private: speech runs on the server you use</small></button>
-        <button type="button" data-engine="google" role="radio" aria-checked="false">Google<small>Chirp speech, Gemini, Chirp HD voices</small></button>
       </div>
       <p class="muted note" id="googlenote" hidden></p>
       <div class="choice" id="llmengine" role="radiogroup" aria-label="Which model writes the answer" style="margin-top:8px" hidden>

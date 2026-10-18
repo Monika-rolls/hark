@@ -743,10 +743,19 @@ function liveStatus() {
             : "listening — just talk", "live");
 }
 
+function devEngine() {
+  try { return new URLSearchParams(location.search).get("engine"); } catch (_) { return null; }
+}
+
 function applyVoiceProvider(name) {
-  voiceProvider = name === "local" || name === "google" ? name : "assemblyai";
-  // An engine the server says it cannot run falls back to the cloud agent.
-  if (voiceProvider === "google" && googleAvailable === false) voiceProvider = "assemblyai";
+  // The page offers Google and Local. The AssemblyAI agent is still on the
+  // server, but a saved "assemblyai" choice (or a server default) now lands on
+  // Google, and on Local when Google is not set up there.
+  voiceProvider = name === "local" ? "local" : "google";
+  if (voiceProvider === "google" && googleAvailable === false) voiceProvider = "local";
+  // Developer switch, not shown in the UI: ?engine=assemblyai keeps the agent
+  // path reachable (and tested) without offering it to listeners.
+  if (devEngine() === "assemblyai") voiceProvider = "assemblyai";
   storageSet("hark:voiceprovider", voiceProvider);
   // Null-safe: a cached older page has no #voiceengine, and a throw here would
   // abort the rest of init -- loadShelf() included, which is what selects a
@@ -811,8 +820,8 @@ function buildVoiceProvider() {
     paintGoogleChoice();
     buildVoices(h.tts_voices, h.tts_voice_default, h.google_tts_voices, h.google_tts_voice_default);
     buildTools(h.tools);
-    applyVoiceProvider(voiceProvider || h.voice_provider || "assemblyai");
-  }).catch(() => applyVoiceProvider(voiceProvider || "assemblyai"));
+    applyVoiceProvider(voiceProvider || h.voice_provider || "google");
+  }).catch(() => applyVoiceProvider(voiceProvider || "google"));
 }
 
 function buildVoices(voices, fallback, gVoices, gFallback) {
