@@ -339,7 +339,6 @@ class NeedleRouter:
                 r"\bwhat did (he|she|they) (mean|say)\b",
                 r"\bi('?m| am) lost\b",
                 r"\bwhere am i\b",
-                r"\brecap\b",
                 r"\bremind me\b",
                 r"\bexplain (that|this)\b",
             ],
@@ -419,6 +418,90 @@ class NeedleRouter:
                     }
                 },
                 "required": ["query"],
+            },
+        },
+        {
+            "name": "recap",
+            "description": (
+                "Summarise the last few minutes they heard, in order. Use for "
+                "'recap', 'catch me up', 'what did I miss', 'summarise the last "
+                "five minutes'."
+            ),
+            "triggers": [r"\brecap\b", r"\bcatch me up\b", r"\bwhat did i (just )?miss\b",
+                         r"\bsumm?ar(y|ise|ize) (the )?(last|past)\b"],
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "minutes": {"type": "number",
+                                "description": "How many minutes back, 1 to 10."}
+                },
+                "required": [],
+            },
+        },
+        {
+            "name": "explain_simply",
+            "description": (
+                "Re-explain what they just heard in plain words with an everyday "
+                "analogy or example. Use for 'explain it simply', 'in plain "
+                "English', 'like I'm five', 'give me an example'."
+            ),
+            "triggers": [r"\b(simpl(e|er|y)|easier|plain (english|words))\b",
+                         r"\blike i'?m (5|five|12|twelve|a kid)\b", r"\beli5\b",
+                         r"\b(an|for) example\b", r"\banalogy\b", r"\bdumb it down\b"],
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "style": {"type": "string",
+                              "description": "'simple' (default) or 'example'."}
+                },
+                "required": [],
+            },
+        },
+        {
+            "name": "translate",
+            "description": (
+                "Explain what they just heard in another language. Use for 'say "
+                "that in Hindi', 'explain in Japanese', 'translate'."
+            ),
+            "triggers": [r"\btranslate\b",
+                         r"\b(in|into) (hindi|telugu|tamil|kannada|malayalam|marathi|"
+                         r"bengali|gujarati|punjabi|urdu|japanese|korean|chinese|"
+                         r"mandarin|thai|vietnamese|indonesian|bahasa|malay|tagalog|"
+                         r"filipino|spanish|french|german|italian|portuguese|arabic)\b"],
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "language": {"type": "string",
+                                 "description": "The language to answer in, e.g. Hindi."}
+                },
+                "required": ["language"],
+            },
+        },
+        {
+            "name": "quiz_me",
+            "description": (
+                "Ask them a question to check they understood what they heard. "
+                "Use for 'quiz me', 'test me', 'ask me a question'."
+            ),
+            "triggers": [r"\bquiz\b", r"\btest me\b", r"\bask me (a )?question\b",
+                         r"\bcheck (if|that) i understood\b"],
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+        {
+            "name": "save_concept",
+            "description": (
+                "Save the idea they just heard to their notes. Use for 'remember "
+                "this', 'save that', 'bookmark this', 'add it to my notes'."
+            ),
+            "triggers": [r"\b(remember|save|bookmark|note) (this|that|it)\b",
+                         r"\badd (this|that|it) to (my )?notes\b"],
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "concept": {"type": "string",
+                                "description": "A short name for the idea, if they said one."}
+                },
+                "required": [],
             },
         },
     ]

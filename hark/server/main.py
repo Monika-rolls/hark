@@ -599,6 +599,166 @@ def tool_outline(session_id: Optional[str]) -> dict:
         f"story, do not give away how it ends.\n\n{_length_rule(session_id)}")}
 
 
+# ---------- learning tools: recap, explain simply, translate, quiz, save ----------
+# Each is a variation on the same move -- take what the listener has heard,
+# stop at the playhead, and tell the answer model what to do with it -- so they
+# share one helper and keep the spoiler cap. The cloud agent calls them over
+# HTTP; the local pipeline calls them in process through run_local_tool.
+
+RECAP_MIN_DEFAULT, RECAP_MIN_MAX = 5.0, 10.0
+QUIZ_TTL_S = 180
+# While a quiz question is pending, these mean "not an answer".
+QUIZ_CANCEL = re.compile(r"\b(stop|cancel|skip|no more|enough|never ?mind)\b", re.I)
+QUIZ_AGAIN = re.compile(r"\b(another|next|new) (question|one)\b|\bquiz me\b", re.I)
+_LANGUAGE_OK = re.compile(r"^[A-Za-z][A-Za-z \-()]{1,29}$")
+
+
+def _heard(session_id: Optional[str], seconds: float):
+    """(error, t, text) for the `seconds` of audio up to the playhead."""
+    t = playheads.get(session_id)
+    if t is None:
+        return ({"ok": False, "message": "I can't tell where you are in the book yet - "
+                                         "is it playing?"}, None, "")
+    lib, _title = library_for(session_id)
+    near = lib.window(t, before=seconds, after=0)
+    if not near:
+        return ({"ok": False, "message": f"There's no indexed text around "
+                                         f"{int(t)//60}:{int(t)%60:02d}."}, t, "")
+    return None, t, _trim_passage(" ".join(c.text for c in near))
+
+
+def _clock(t: float) -> str:
+    return f"{int(t)//60}:{int(t)%60:02d}"
+
+
+def tool_recap(session_id: Optional[str], minutes=None) -> dict:
+    """'Catch me up': the last few minutes, summarised in order."""
+    try:
+        minutes = max(1.0, min(RECAP_MIN_MAX, float(minutes or RECAP_MIN_DEFAULT)))
+    except (TypeError, ValueError):
+        minutes = RECAP_MIN_DEFAULT
+    err, t, text = _heard(session_id, minutes * 60)
+    if err:
+        return err
+    return {"ok": True, "message": (
+        f"RECAP of the last {minutes:g} minutes, up to {_clock(t)}:\n{text}\n\n"
+        f"Recap what they heard, in order, in three or four short spoken sentences. "
+        f"Lead with the main idea. Nothing after {_clock(t)}.")}
+
+
+def tool_explain_simply(session_id: Optional[str], style=None) -> dict:
+    """Re-explain the passage at the playhead plainly, with an everyday example."""
+    err, t, text = _heard(session_id, _lookback(session_id))
+    if err:
+        return err
+    how = ("with one concrete example" if str(style or "").lower().startswith("ex")
+           else "as if to a curious twelve-year-old, with one everyday analogy")
+    return {"ok": True, "message": (
+        f"What they just heard (up to {_clock(t)}):\n{text}\n\n"
+        f"Explain the main idea of this simply, {how}. No jargon: if a technical "
+        f"word is unavoidable, define it in passing. Three short sentences at most.")}
+
+
+def tool_translate(session_id: Optional[str], language=None) -> dict:
+    """Explain what was just heard in another language."""
+    language = str(language or "").strip()
+    if not _LANGUAGE_OK.match(language):
+        return {"ok": False, "message": "Ask which language they would like it in."}
+    err, t, text = _heard(session_id, _lookback(session_id))
+    if err:
+        return err
+    return {"ok": True, "language": language, "message": (
+        f"What they just heard (up to {_clock(t)}):\n{text}\n\n"
+        f"Explain what this passage says, in {language}. Write the whole answer in "
+        f"{language}, in its usual script, in two or three simple sentences. "
+        f"Keep names and technical terms recognisable.")}
+
+
+def tool_quiz(session_id: Optional[str], answer=None, question=None) -> dict:
+    """Ask one question on what was heard; or, given their answer, mark it."""
+    err, t, text = _heard(session_id, max(180.0, _lookback(session_id)))
+    if err:
+        return err
+    if answer and question:
+        return {"ok": True, "message": (
+            f"What they heard (up to {_clock(t)}):\n{text}\n\n"
+            f"QUIZ. You asked: {question}\nThey answered: {answer}\n\n"
+            f"Tell them whether that is right, in one or two sentences. If it is "
+            f"wrong or partly right, give the correct answer from the passage. "
+            f"Then ask if they want another question.")}
+    return {"ok": True, "message": (
+        f"What they heard (up to {_clock(t)}):\n{text}\n\n"
+        f"QUIZ. Ask them ONE short question that checks they understood the key "
+        f"idea here -- not a trivia detail. Say only the question, then stop and "
+        f"wait for their answer. When they answer, judge it against this passage.")}
+
+
+def tool_save(session_id: Optional[str], concept=None) -> dict:
+    """'Remember this': the page saves a note at the playhead; we confirm it."""
+    err, t, text = _heard(session_id, 30.0)
+    if err:
+        return err
+    concept = str(concept or "").strip()[:120]
+    snippet = text[-300:]
+    snippet = snippet[snippet.find(" ") + 1:] if len(text) > 300 else snippet
+    return {"ok": True,
+            "note": {"at": round(t, 1), "concept": concept, "text": snippet},
+            "message": (
+                f"SAVED to their notes at {_clock(t)}"
+                f"{': ' + concept if concept else ''}. The passage saved:\n{snippet}\n\n"
+                f"Confirm in ONE short sentence, naming the idea that was saved.")}
+
+
+class LearningCall(BaseModel):
+    session_id: Optional[str] = None
+    minutes: Optional[float] = None
+    style: Optional[str] = None
+    language: Optional[str] = None
+    answer: Optional[str] = None
+    question: Optional[str] = None
+    concept: Optional[str] = None
+
+
+def _learning_args(call: LearningCall) -> dict:
+    return {k: v for k, v in call.dict().items()
+            if k != "session_id" and v not in (None, "")}
+
+
+@app.post("/tools/recap")
+def recap(call: LearningCall, request: Request):
+    sid = _tool_session(call.session_id, request)
+    _note_tool(sid, "recap", _learning_args(call))
+    return tool_recap(sid, call.minutes)
+
+
+@app.post("/tools/explain_simply")
+def explain_simply(call: LearningCall, request: Request):
+    sid = _tool_session(call.session_id, request)
+    _note_tool(sid, "explain_simply", _learning_args(call))
+    return tool_explain_simply(sid, call.style)
+
+
+@app.post("/tools/translate")
+def translate(call: LearningCall, request: Request):
+    sid = _tool_session(call.session_id, request)
+    _note_tool(sid, "translate", _learning_args(call))
+    return tool_translate(sid, call.language)
+
+
+@app.post("/tools/quiz_me")
+def quiz_me(call: LearningCall, request: Request):
+    sid = _tool_session(call.session_id, request)
+    _note_tool(sid, "quiz_me", _learning_args(call))
+    return tool_quiz(sid, call.answer, call.question)
+
+
+@app.post("/tools/save_concept")
+def save_concept(call: LearningCall, request: Request):
+    sid = _tool_session(call.session_id, request)
+    _note_tool(sid, "save_concept", _learning_args(call))
+    return tool_save(sid, call.concept)
+
+
 class WebSearchCall(BaseModel):
     session_id: Optional[str] = None
     query: Optional[str] = None
@@ -806,6 +966,16 @@ def run_local_tool(session_id: Optional[str], name: str, args: dict) -> dict:
         return tool_outline(session_id)
     if name == "web_search":
         return tool_web_search(session_id, str(args.get("query", "")).strip())
+    if name == "recap":
+        return tool_recap(session_id, args.get("minutes"))
+    if name == "explain_simply":
+        return tool_explain_simply(session_id, args.get("style"))
+    if name == "translate":
+        return tool_translate(session_id, args.get("language"))
+    if name == "quiz_me":
+        return tool_quiz(session_id, args.get("answer"), args.get("question"))
+    if name == "save_concept":
+        return tool_save(session_id, args.get("concept"))
     return tool_passage(session_id, args.get("search"))
 
 
@@ -979,7 +1149,16 @@ async def voice_socket(ws: WebSocket):
                 await ws.send_json({"type": "reply.done", "status": "complete"})
                 continue
 
-            name, args = await run_in_threadpool(local_voice.router.route, text)
+            quiz_key = f"hark:quiz:{sid}"
+            pending = playheads.kv_get(quiz_key) if sid else None
+            if pending and not QUIZ_CANCEL.search(text) and not QUIZ_AGAIN.search(text):
+                # They are answering the question Hark just asked.
+                name, args = "quiz_me", {"question": pending, "answer": text}
+                playheads.kv_set(quiz_key, "", ttl=1)
+            else:
+                if pending:
+                    playheads.kv_set(quiz_key, "", ttl=1)
+                name, args = await run_in_threadpool(local_voice.router.route, text)
             # The router picks web_search but may leave the query out; the
             # question itself is the best query then.
             if name == "web_search" and not str((args or {}).get("query", "")).strip():
@@ -989,12 +1168,17 @@ async def voice_socket(ws: WebSocket):
             # path the same thing rides the heartbeat, because AssemblyAI calls
             # the tool server-to-server and the page cannot see it.
             await ws.send_json({"type": "tool.call", "name": name, "arguments": args})
+            if name == "save_concept" and result.get("note"):
+                await ws.send_json({"type": "note.saved", **result["note"]})
             await ws.send_json({"type": "reply.started"})
             # Written and spoken sentence by sentence: the first sentence plays
             # while the rest is still being generated.
             holder = {"text": "", "fallback": _fallback_answer(result)}
             sentences = local_answer_stream(text, result.get("message", ""), llm)
             await _stream_reply(ws, sentences, holder, voice)
+            if name == "quiz_me" and not args.get("answer") and holder["text"] and sid:
+                # Remember the question, so the next thing they say is marked.
+                playheads.kv_set(f"hark:quiz:{sid}", holder["text"][:400], ttl=QUIZ_TTL_S)
             if not holder["text"]:
                 # Gemini produced nothing, so the worker spoke the passage; the
                 # page still needs the words to show.
