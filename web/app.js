@@ -882,7 +882,7 @@ function buildTools(tools) {
     const name = document.createElement("b");
     name.textContent = t.label || t.id;
     const desc = document.createElement("small");
-    desc.textContent = t.always_on ? (t.description || "") + " Always on." : (t.description || "");
+    desc.textContent = t.always_on ? (t.description || "") + " · always on" : (t.description || "");
     const box = document.createElement("input");
     box.type = "checkbox";
     box.setAttribute("role", "switch");
