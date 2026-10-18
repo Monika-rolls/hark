@@ -1053,7 +1053,7 @@ PARTIAL_INTERVAL_S = 1.0
 PARTIAL_MIN_S = 1.1
 # Less voiced audio than this in a turn is not a question (only checked when
 # Silero is gating; loudness alone cannot tell).
-MIN_VOICED_S = 0.25
+MIN_VOICED_S = 0.45
 
 
 async def _partial_transcript(ws: WebSocket, endpointer, generation: int,
@@ -1200,7 +1200,7 @@ async def voice_socket(ws: WebSocket):
             # Whisper-family models answer noise with a handful of stock phrases
             # ("Thank you.", "Thanks for watching"). On a short clip, one of those
             # is the model filling in, not the listener talking.
-            if len(audio16) < 1.6 * STT_RATE and text.lower().strip(" .,!?") in HALLUCINATIONS:
+            if text.lower().strip(" .,!?") in HALLUCINATIONS:
                 print(f"[local] dropped a likely hallucination: {text!r}")
                 await ws.send_json({"type": "reply.done", "status": "dropped"})
                 continue
