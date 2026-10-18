@@ -1,0 +1,90 @@
+name: deploy
+
+# Every push to main (a merged pull request included) is tested, then built and
+# deployed to Cloud Run. GitHub authenticates to Google through Workload
+# Identity Federation: no service-account key is stored anywhere. The provider
+# only accepts tokens for Monika-rolls/hark on refs/heads/main.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One deploy at a time; a newer push waits rather than racing an older one.
+concurrency:
+  group: deploy-cloud-run
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PROJECT_ID: hark-labs-1018
+  REGION: asia-southeast1
+  SERVICE: hark
+  IMAGE: asia-southeast1-docker.pkg.dev/hark-labs-1018/hark/hark
+  # Local-only titles (the Huberman episode) are not in git; they live in this
+  # private bucket and are copied into the build context.
+  MEDIA_BUCKET: gs://hark-labs-1018-media
+  WIF_PROVIDER: projects/130328189871/locations/global/workloadIdentityPools/github/providers/hark-main
+  DEPLOYER: github-deployer@hark-labs-1018.iam.gserviceaccount.com
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # Same as tests.yml: the app's dependencies plus pytest. The audio and
+      # model tests skip without their packages; nothing needs a key.
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      - name: Test
+        run: pytest -q
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOYER }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Fetch local-only media
+        run: gcloud storage cp --recursive "$MEDIA_BUCKET/media" .
+
+      - name: Build and push the image
+        run: |
+          gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+          docker build -t "$IMAGE:${GITHUB_SHA}" -t "$IMAGE:latest" .
+          docker push --all-tags "$IMAGE"
+
+      # Only the image changes: environment variables and the Gemini secret
+      # already set on the service are kept.
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy "$SERVICE" \
+            --project "$PROJECT_ID" --region "$REGION" \
+            --image "$IMAGE:${GITHUB_SHA}" --quiet
+
+      - name: Smoke test
+        run: |
+          url=$(gcloud run services describe "$SERVICE" --project "$PROJECT_ID" \
+                --region "$REGION" --format='value(status.url)')
+          echo "Deployed: $url" >> "$GITHUB_STEP_SUMMARY"
+          curl -fsS --retry 5 --retry-delay 10 --max-time 120 "$url/api/health" \
+            | tee /dev/stderr | grep -q '"ok":true'

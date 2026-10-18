@@ -1,8 +1,10 @@
 name: tests
 
+# Pull requests and branches. Pushes to main are tested by deploy.yml, which
+# deploys only when the tests pass.
 on:
   push:
-    branches: [main]
+    branches-ignore: [main]
   pull_request:
 
 jobs:
