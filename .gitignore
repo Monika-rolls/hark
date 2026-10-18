@@ -1,0 +1,43 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+.vercel
+
+# Working audio. The committed copy of the book lives in public/audio/ (that is
+# what Vercel serves); audio/ is scratch space for building an index.
+# Leading slash matters: a bare 'audio/' also swallows public/audio/.
+/audio/
+
+# Scratch indexes. data/relativity.* is committed so a clone runs as-is.
+data/chroma/
+data/chapter4.*
+data/_*
+
+# Internal planning doc: hackathon strategy, competitor notes, judging analysis.
+# Stays local.
+PROGRESS.md
+
+# Run sheet: video script, submission copy, launch order. Strategy, stays local.
+LAUNCH.md
+
+# Throwaway pages used for headless screenshots.
+web/_*.html
+data/.spend_cache.json
+
+# Video production files (includes a voice clone), not for the public repo
+video/
+
+# Local answer-model weights (Qwen GGUF for llama.cpp). Gigabytes; never commit.
+/models/
+
+
+# Local-only weights, scratch audio and logs. Too large for GitHub (100 MB cap).
+/checkpoints/
+/*.mp3
+*.log
+data/podcast-32k.*
+.pytest_cache/
+
+# Hackathon submission artwork, branded with the project's old name.
+/submission/

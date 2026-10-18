@@ -1,0 +1,905 @@
+"""Bring your own audiobook: transcribe it, index it, serve it like the shipped one.
+
+The built-in book is a SQLite file baked into the repo. A book someone adds at
+runtime cannot be: the filesystem on a lambda is read-only, and the request that
+builds the index is not the request that later reads it. So a user book lives in
+the same Redis the playhead uses, behind a class with the same surface as
+`hark.core.library.Library` -- `window`, `search`, `duration_hint`, `len` -- so
+the tools in main.py never learn which kind of book they are holding.
+
+The pipeline is deliberately resumable, one bounded slice of work per HTTP
+request:
+
+    transcribing -> indexing -> ready
+
+Nothing here may block. A serverless function is killed at ten seconds, and
+transcribing an audiobook takes minutes, so `advance()` does a little work,
+writes down where it got to, and returns. The browser polls; each poll pushes
+the job one step further. That also gives the page a real progress number
+instead of a spinner that means nothing.
+"""
+import base64
+import http.client
+import json
+import os
+import re
+import socket
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+import numpy as np
+
+from hark.core.library import Chunk, WINDOW_AFTER_S, WINDOW_BEFORE_S
+
+AAI_BASE = "https://api.assemblyai.com/v2"
+
+# Gemini caps an embedding batch at 100, and one batch is about a second of
+# work -- a safe amount to do inside a single request.
+SLICE = 100
+# 768-d, matching hark.core.brain.EMBED_DIM and the shipped .npy.
+DIM = 768
+# Stored as float16. Cosine similarity over normalised vectors does not care
+# about the last few bits of mantissa, and it halves what crosses the wire.
+VEC_DTYPE = "float16"
+
+# How long an indexed book survives in the store. Thirty days is right for a
+# book a stranger added and will never open again. It is wrong for the featured
+# shelf, which has to outlive a judging window that starts after submissions
+# close -- so scripts/seed_featured.py raises this before importing, and the
+# books it writes keep whatever it set.
+BOOK_TTL = int(os.getenv("HARK_BOOK_TTL_DAYS", "30") or 30) * 24 * 3600
+# An upper bound on a single book, in chunks (~1800 is a ten-hour book).
+# 0 means no ceiling. Left as a setting rather than deleted because it is the
+# only thing standing between one enormous file and the whole store.
+MAX_CHUNKS = int(os.getenv("HARK_MAX_CHUNKS", "0") or 0)
+
+
+# A book has to be plausibly a book: long enough to be worth indexing, small
+# enough that one link cannot run up an unbounded transcription bill.
+MAX_SOURCE_BYTES = 150 * 1024 * 1024
+# Speech, not music. Below this many characters per minute of audio, whatever
+# was sent is a song, a field recording, or silence with a cough in it.
+MIN_CHARS_PER_MINUTE = 250
+# Hosts that serve a page, not a file. AssemblyAI fetches the URL directly, so
+# these can never work, and pulling media out of them is against their terms
+# besides. Naming them lets us say why instead of failing minutes later.
+PAGE_NOT_FILE = {
+    "youtube.com", "m.youtube.com", "youtu.be", "music.youtube.com",
+    "spotify.com", "open.spotify.com", "soundcloud.com", "vimeo.com",
+    "audible.com", "audible.co.uk", "podcasts.apple.com", "music.apple.com",
+    "drive.google.com", "dropbox.com", "twitch.tv", "tiktok.com",
+}
+AUDIO_EXTS = {"mp3", "m4a", "m4b", "wav", "ogg", "oga", "opus", "flac", "aac",
+              "wma", "webm", "mp4", "mov", "mkv", "aiff", "aif", "caf"}
+
+
+class RejectedURL(ValueError):
+    """The link is not something we are willing to hand to a transcriber."""
+
+
+def _is_public_host(host: str) -> bool:
+    """Resolve a hostname and refuse anything that is not a public address.
+
+    We make the request from our own server, so an unchecked link is a
+    server-side request forgery: 169.254.169.254 is a cloud metadata endpoint,
+    and 127.0.0.1 is whatever else happens to be listening next to us.
+    """
+    import ipaddress
+    import socket
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return False
+    return True
+
+
+class _GuardedRedirects(urllib.request.HTTPRedirectHandler):
+    """Re-check the host on every hop.
+
+    Validating only the URL someone typed is not enough: a public host is free
+    to redirect us straight at a private one.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        host = urllib.parse.urlparse(newurl).hostname or ""
+        if not _is_public_host(host):
+            raise RejectedURL("that link redirects somewhere we will not follow")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def check_source(url: str, max_bytes: int = MAX_SOURCE_BYTES) -> dict:
+    """Decide whether a link is worth handing to AssemblyAI, before we do.
+
+    Returns what the HEAD told us. A server that refuses HEAD is not treated as
+    a failure -- plenty of file hosts do -- but then nothing is known about the
+    file and MAX_CHUNKS is the only ceiling left.
+    """
+    parts = urllib.parse.urlparse(url)
+    if parts.scheme not in ("http", "https"):
+        raise RejectedURL("that needs to be an http or https link")
+
+    # A page that *contains* audio is not a link to audio. AssemblyAI fetches
+    # the URL directly, so a YouTube watch page gives it HTML. Saying that
+    # plainly beats a transcription job that fails four minutes later.
+    host = (parts.hostname or "").lower().removeprefix("www.")
+    if host in PAGE_NOT_FILE:
+        raise RejectedURL(
+            f"{host} gives a web page, not an audio file, and there is no way "
+            f"to read the audio out of it from here. Paste a direct link to a "
+            f"media file - anything ending in .mp3, .m4a or .mp4. Archive.org, "
+            f"a podcast feed's enclosure, S3, or a Dropbox direct link "
+            f"(dl.dropboxusercontent.com) all work.")
+    if not parts.hostname:
+        raise RejectedURL("that link has no host in it")
+    if not _is_public_host(parts.hostname):
+        raise RejectedURL("that address is not reachable from the public internet")
+
+    opener = urllib.request.build_opener(_GuardedRedirects)
+    req = urllib.request.Request(url, method="HEAD",
+                                 headers={"User-Agent": "Hark/1.0"})
+    try:
+        with opener.open(req, timeout=10) as r:
+            ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            length = int(r.headers.get("Content-Length") or 0)
+    except RejectedURL:
+        raise
+    except Exception as exc:
+        # Plenty of file hosts refuse HEAD, so this cannot be fatal. But with
+        # nothing known about the file, a clearly non-audio extension is the
+        # only signal left -- and it catches the common paste-the-wrong-link
+        # mistake. No extension at all (CDNs, stream URLs) still goes through.
+        print(f"[books] HEAD failed for {url[:80]}: {exc}")
+        ext = re.search(r"\.([a-z0-9]{2,5})$", parts.path, re.I)
+        if ext and ext.group(1).lower() not in AUDIO_EXTS:
+            raise RejectedURL(f"that link ends in .{ext.group(1).lower()}, "
+                              f"which is not an audio file")
+        return {"content_type": "", "bytes": 0}
+
+    if max_bytes and length and length > max_bytes:
+        raise RejectedURL(
+            f"that file is {length / 1e6:.0f} MB, and the ceiling here is "
+            f"{max_bytes // 1_000_000} MB. Try a single chapter.")
+    # Plenty of hosts serve audio as octet-stream, so only a confidently wrong
+    # type is rejected.
+    if ctype and not (ctype.startswith("audio/") or ctype.startswith("video/")
+                      or ctype in ("application/octet-stream", "binary/octet-stream")):
+        raise RejectedURL(f"that link is {ctype}, not an audio file")
+    return {"content_type": ctype, "bytes": length}
+
+
+def slug(title: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", (title or "book").lower()).strip("-")
+    return (s[:40] or "book") + "-" + format(int(time.time() * 1000) % 0xFFFFFF, "x")
+
+
+# ---------- AssemblyAI ----------
+
+def _aai(path: str, key: str, payload: Optional[dict] = None, timeout: int = 15):
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(
+        f"{AAI_BASE}{path}",
+        data=data,
+        headers={"Authorization": key,
+                 **({"Content-Type": "application/json"} if data else {})},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+def upload_bytes(raw: bytes, key: str) -> str:
+    """Hand raw audio to AssemblyAI and get back a URL only they can read.
+
+    On Vercel the platform caps a request body at ~4.5 MB, so this is a chapter,
+    not a novel; locally the only ceiling is HARK_MAX_UPLOAD_MB and a long
+    recording can be uploaded whole. Either way the bytes go in one request, so
+    the timeout is sized to the payload -- a flat 60 s cut long uploads off
+    mid-transfer, which surfaced as a generic "upload failed".
+    """
+    # ~0.25 MB/s floor plus headroom, clamped to 5-30 minutes.
+    timeout = max(300, min(1800, len(raw) // (256 * 1024)))
+    req = urllib.request.Request(
+        f"{AAI_BASE}/upload", data=raw,
+        headers={"Authorization": key, "Content-Type": "application/octet-stream"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)["upload_url"]
+
+
+def start_transcription(audio_url: str, key: str) -> str:
+    """Queue the job and return immediately. Polling happens in advance()."""
+    # speech_models is left at its default (universal-3-5-pro, falling back to
+    # universal-2). Pinning it here would silently break when the flagship
+    # model is renamed, which has already happened once on this project.
+    #
+    # auto_chapters is OFF, and that is a cost decision made with numbers.
+    #
+    # It bills +$0.08 per audio hour on top of a $0.15-0.21 base -- roughly a
+    # third of the whole bill. Measured over the 139.6 hours this project has
+    # transcribed: $40.49 with it, $29.32 without. It is also deprecated, and
+    # English-only: it was billed against 9.6 hours of Spanish audio and
+    # returned no chapters at all.
+    #
+    # What it bought was nicer chapter titles. `contents()` derives a table of
+    # contents from the narrator's own announcements instead, which is what
+    # every LibriVox recording opens each file with anyway. Set
+    # HARK_AUTO_CHAPTERS=1 to turn it back on for a single book if a
+    # recording genuinely has no spoken structure.
+    #
+    # language_detection stays ON, because "any audiobook" has to mean any
+    # language. Without it the request defaults to English and a Spanish
+    # recording comes back as fluent-looking nonsense -- which indexes
+    # cleanly, answers confidently, and is wrong: the worst of the three
+    # available failures. It is not a paid add-on.
+    body = {"audio_url": audio_url, "punctuate": True, "format_text": True,
+            "language_detection": True}
+    if os.getenv("HARK_AUTO_CHAPTERS", "") in ("1", "true", "yes"):
+        body["auto_chapters"] = True
+    # Both extras are optional. auto_chapters is English-only and rejects short
+    # files; language detection can be unavailable on a model. Drop whichever
+    # the API names and try again rather than refusing the book over a feature
+    # that was never the point.
+    for _ in range(2):
+        try:
+            return _aai("/transcript", key, body)["id"]
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode()[:300]
+            dropped = [k for k in ("auto_chapters", "language_detection")
+                       if k in detail and k in body]
+            if not dropped:
+                raise
+            print(f"[books] {'/'.join(dropped)} rejected, retrying without: "
+                  f"{detail[:120]}")
+            for k in dropped:
+                body.pop(k)
+    return _aai("/transcript", key, body)["id"]
+
+
+# ---------- the record ----------
+
+@dataclass
+class BookRecord:
+    id: str
+    title: str
+    audio_url: str
+    transcript_id: str = ""
+    status: str = "transcribing"       # transcribing | indexing | ready | failed
+    error: str = ""
+    n_chunks: int = 0
+    embedded: int = 0
+    duration: float = 0.0
+    builtin: bool = False
+    created: float = 0.0
+    # A real audiobook is published as one file per chapter, so a book is a
+    # list of parts laid end to end on a single timeline. Each carries the
+    # offset its chunks were shifted by, which is what lets a question at
+    # 4:12:30 find the right passage in the right file.
+    # [{url, transcript_id, offset_s, duration_s, done}]
+    parts: List[dict] = field(default_factory=list)
+    part_index: int = 0                # which part is being waited on
+    chunk_cursor: int = 0              # chunks written to shards so far
+    # Consecutive network wobbles. Reset the moment anything succeeds, so a
+    # blip at part 3 and another at part 40 never add up to a failure.
+    transient: int = 0
+
+    @property
+    def progress(self) -> int:
+        """0-100. Transcription is the long pole, so it owns most of the bar."""
+        if self.status == "ready":
+            return 100
+        if self.status == "transcribing":
+            if len(self.parts) > 1:
+                return 5 + int(35 * self.part_index / len(self.parts))
+            return 10
+        if self.status == "indexing" and self.n_chunks:
+            return 40 + int(55 * self.embedded / self.n_chunks)
+        return 0
+
+    def public(self) -> dict:
+        return {"id": self.id, "title": self.title, "audio_url": self.audio_url,
+                "status": self.status, "error": self.error, "progress": self.progress,
+                "chunks": self.n_chunks, "duration": round(self.duration, 1),
+                "builtin": self.builtin,
+                # The player needs every part and where each begins, so it can
+                # treat the lot as one continuous recording.
+                "parts": [{"url": p["url"], "offset_s": round(p.get("offset_s", 0), 2),
+                           "duration_s": round(p.get("duration_s", 0), 2)}
+                          for p in self.parts],
+                "part_count": len(self.parts),
+                "parts_done": self.part_index}
+
+
+def _key(book_id: str, part: str = "meta") -> str:
+    return f"hark:book:{book_id}:{part}"
+
+
+def load(store, book_id: str) -> Optional[BookRecord]:
+    raw = store.kv_get(_key(book_id))
+    if not raw:
+        return None
+    try:
+        return BookRecord(**json.loads(raw))
+    except Exception:
+        return None
+
+
+def load_many(store, book_ids) -> dict:
+    """Several books in one round trip, for callers that know all the ids.
+
+    The featured shelf is a dozen books and is read on every page load. Loaded
+    one at a time that is a dozen sequential calls to Upstash inside a function
+    with a ten-second budget, which is how a shelf becomes the slow part of a
+    demo. Missing or unreadable records are simply absent from the result.
+    """
+    ids = list(book_ids)
+    if not ids:
+        return {}
+    out = {}
+    for book_id, raw in zip(ids, store.kv_mget([_key(i) for i in ids])):
+        if not raw:
+            continue
+        try:
+            out[book_id] = BookRecord(**json.loads(raw))
+        except Exception:
+            continue
+    return out
+
+
+def save(store, rec: BookRecord) -> None:
+    store.kv_set(_key(rec.id), json.dumps(rec.__dict__), ttl=BOOK_TTL)
+
+
+def _shelf_key(client_id: str) -> str:
+    return f"hark:books:{client_id or 'anon'}"
+
+
+def create(store, title: str, audio_urls, aai_key: str, client_id: str = "",
+           book_id: str = "") -> BookRecord:
+    """Start a book from one or more audio files, in reading order.
+
+    A given book_id makes it reproducible, which is what the featured shelf
+    needs -- otherwise every re-seed makes a new stranger.
+
+    Nothing is transcribed here. The first advance() queues a batch and starts
+    absorbing them, so creating a sixty-chapter book returns as fast as
+    creating a one-chapter one.
+    """
+    urls = [audio_urls] if isinstance(audio_urls, str) else list(audio_urls)
+    if not urls:
+        raise ValueError("a book needs at least one audio file")
+    rec = BookRecord(id=book_id or slug(title), title=title.strip() or "Untitled book",
+                     audio_url=urls[0], created=time.time(),
+                     parts=[{"url": u, "transcript_id": "", "offset_s": 0.0,
+                             "duration_s": 0.0, "done": False} for u in urls])
+    save(store, rec)
+    if client_id:
+        store.kv_push(_shelf_key(client_id), rec.id)
+    return rec
+
+
+def forget(store, book_id: str, client_id: str = "") -> None:
+    """Unlist a book for one browser. The index is left to expire on its own."""
+    store.kv_remove(_shelf_key(client_id), book_id)
+
+
+def shelf(store, client_id: str = "") -> List[dict]:
+    """The books this browser added, newest first.
+
+    Deliberately not a shared shelf. There are no accounts, so a global list
+    would put whatever a stranger uploaded on the front page of a live demo --
+    and this one is being judged in public. The client id is a random string
+    the browser keeps in localStorage; it is an identifier, not a credential.
+    """
+    out = []
+    for book_id in store.kv_list(_shelf_key(client_id), 30):
+        rec = load(store, book_id)
+        if rec:
+            out.append(rec.public())
+    return out
+
+
+# ---------- the pipeline ----------
+
+def advance(store, rec: BookRecord, aai_key: str, embedder) -> BookRecord:
+    """Push one book one step. Safe to call repeatedly; safe to call on a
+    finished book. Every branch returns well inside a request timeout."""
+    if rec.status in ("ready", "failed"):
+        return rec
+    try:
+        if rec.status == "transcribing":
+            out = _poll_transcript(store, rec, aai_key)
+        elif rec.status == "indexing":
+            out = _embed_slice(store, rec, embedder)
+        else:
+            return rec
+        # A clean pass wipes the slate: a wobble at part 3 and another at part
+        # 40 are two blips, not a book on its way to failing.
+        if out.status != "failed" and out.transient:
+            out.transient = 0
+            save(store, out)
+        return out
+    except urllib.error.HTTPError as e:
+        # 429 and 5xx are AssemblyAI having a moment, not this book being bad.
+        if e.code == 429 or e.code >= 500:
+            return _defer(store, rec, f"{e.code} from AssemblyAI")
+        return _fail(store, rec, f"{e.code}: {e.read().decode()[:160]}")
+    except _TRANSIENT as exc:
+        return _defer(store, rec, f"{type(exc).__name__}: {exc}")
+    except Exception as exc:
+        # A quota window is not a reason to throw away a finished transcript.
+        if _is_rate_limited(exc):
+            return _defer(store, rec, f"rate limited: {str(exc)[:140]}")
+        return _fail(store, rec, str(exc)[:200])
+    return rec
+
+
+# Errors that mean "the network wobbled", not "this book cannot be indexed".
+# A read timeout eleven parts into a fifteen-part book used to mark the whole
+# thing failed and throw away everything already paid for -- which is both the
+# most expensive moment to give up and the one most likely to be a blip.
+_TRANSIENT = (TimeoutError, ConnectionError, socket.timeout,
+              urllib.error.URLError, http.client.HTTPException)
+# Consecutive wobbles before we accept it is not a wobble. Each one costs a
+# poll interval, so this is minutes of patience, not hours.
+MAX_TRANSIENT = 10
+
+# A 429 from the embedding model is a quota window, not a bad book. Treated as
+# fatal it marked a book failed mid-index -- "Indexing failed: 429
+# RESOURCE_EXHAUSTED" -- usually after the transcription had already been paid
+# for. The free Gemini tier allows ~100 embed items a minute, so a long book
+# will genuinely hit this.
+_RATE_LIMIT_HINTS = ("429", "resource_exhausted", "rate limit", "quota",
+                     "too many requests")
+
+
+def _is_rate_limited(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(hint in text for hint in _RATE_LIMIT_HINTS)
+
+
+def _defer(store, rec: BookRecord, message: str) -> BookRecord:
+    """Leave the book alone and let the next poll try again."""
+    rec.transient = getattr(rec, "transient", 0) + 1
+    if rec.transient > MAX_TRANSIENT:
+        return _fail(store, rec, f"gave up after {rec.transient} attempts "
+                                 f"in a row; the last was {message}")
+    print(f"[books] {rec.id}: {message} (attempt {rec.transient}, will retry)")
+    save(store, rec)
+    return rec
+
+
+def _fail(store, rec: BookRecord, message: str) -> BookRecord:
+    rec.status, rec.error = "failed", message
+    save(store, rec)
+    print(f"[books] {rec.id} failed: {message}")
+    return rec
+
+
+# How many transcription jobs to hand AssemblyAI per request. They run in
+# parallel on their side, so a 15-chapter book is not 15 times the wait -- but
+# submitting all of them in one request would blow the function's time budget.
+SUBMIT_BATCH = 8
+
+
+# A transcription job that has sat unfinished for this long is not slow, it is
+# stuck. Observed live: part one of a thirteen-part book stayed "processing"
+# for twenty minutes while parts two and four finished in seconds.
+STALL_SECONDS = 15 * 60
+# Resubmits allowed per part. Each one costs another transcription of that
+# file, so this is deliberately small.
+MAX_RESUBMITS = 2
+
+
+def _nudge_if_stalled(store, rec: BookRecord, part: dict, aai_key: str) -> BookRecord:
+    """Re-submit a part that has stopped making progress.
+
+    Parts are absorbed strictly in order, because each one's timestamps are
+    shifted by the total duration of everything before it. That makes a single
+    stuck job fatal in a quiet way: the book sits at the same percentage
+    forever, with no error to show and nothing to retry, while every other
+    part finished long ago.
+    """
+    since = part.get("submitted_at") or 0
+    if not since:
+        # A part submitted before this field existed, or by an older build.
+        # Start its clock now rather than never nudging it: an unknown
+        # submission time must not mean "wait forever".
+        part["submitted_at"] = time.time()
+        save(store, rec)
+        return rec
+    if time.time() - since < STALL_SECONDS:
+        return rec
+    if part.get("resubmits", 0) >= MAX_RESUBMITS:
+        return _fail(store, rec,
+                     f"part {rec.part_index + 1} of {len(rec.parts)} never finished "
+                     f"transcribing, after {MAX_RESUBMITS} attempts")
+    part["resubmits"] = part.get("resubmits", 0) + 1
+    print(f"[books] {rec.id}: part {rec.part_index + 1} stalled, resubmitting "
+          f"(attempt {part['resubmits'] + 1})")
+    part["transcript_id"] = start_transcription(part["url"], aai_key)
+    part["submitted_at"] = time.time()
+    save(store, rec)
+    return rec
+
+
+def _poll_transcript(store, rec: BookRecord, aai_key: str) -> BookRecord:
+    """Walk the parts: submit what has not been sent, absorb what has finished.
+
+    One part per call, so the work stays inside a request no matter how long
+    the book is. Parts are absorbed in order -- they have to be, because each
+    one's chunks are shifted by the total duration of everything before it --
+    but they transcribe in parallel, so the wait is the slowest part, not the
+    sum of them.
+    """
+    # Get the rest of the book queued while we wait on the current part.
+    queued = 0
+    for part in rec.parts:
+        if part.get("transcript_id") or queued >= SUBMIT_BATCH:
+            continue
+        try:
+            part["transcript_id"] = start_transcription(part["url"], aai_key)
+            part["submitted_at"] = time.time()
+            queued += 1
+        except urllib.error.HTTPError as exc:
+            return _fail(store, rec,
+                         f"AssemblyAI would not take part {rec.parts.index(part) + 1}: "
+                         f"{exc.read().decode()[:140]}")
+    if queued:
+        save(store, rec)
+
+    part = rec.parts[rec.part_index]
+    if not part.get("transcript_id"):
+        return rec                      # queued behind the batch; next call gets it
+
+    t = _aai(f"/transcript/{part['transcript_id']}", aai_key)
+    status = t.get("status")
+    if status == "error":
+        err = t.get("error", "transcription failed")
+        # archive.org in particular will 503 a file it served happily a minute
+        # earlier. We used to say "that is usually temporary" and then fail
+        # permanently, which is both inconsistent and expensive: it threw away
+        # twelve finished parts of a thirteen-part book because the last file
+        # was briefly unavailable. Retry it ourselves instead, and only give up
+        # when the same file has refused several times.
+        temporary = ("download" in err.lower() or "unable to" in err.lower()
+                     or "timeout" in err.lower() or "503" in err)
+        if temporary and part.get("resubmits", 0) < MAX_RESUBMITS:
+            part["resubmits"] = part.get("resubmits", 0) + 1
+            print(f"[books] {rec.id}: part {rec.part_index + 1} could not be "
+                  f"downloaded, retrying (attempt {part['resubmits'] + 1})")
+            part["transcript_id"] = start_transcription(part["url"], aai_key)
+            part["submitted_at"] = time.time()
+            save(store, rec)
+            return rec
+        if temporary:
+            err = ("the host would not hand over the file, across several "
+                   "attempts. That is usually temporary - try it again.")
+        if len(rec.parts) > 1:
+            err = f"part {rec.part_index + 1} of {len(rec.parts)}: {err}"
+        return _fail(store, rec, err)
+    if status != "completed":
+        return _nudge_if_stalled(store, rec, part, aai_key)
+
+    paras = _aai(f"/transcript/{part['transcript_id']}/paragraphs", aai_key)
+    payload = {"paragraphs": paras.get("paragraphs", []),
+               "text": t.get("text", ""),
+               "audio_duration": t.get("audio_duration", 0)}
+    chunks = _chunks_from(payload)
+
+    # Judge the recording on its first part only. A silent interlude in chapter
+    # seven should not throw away six chapters already paid for.
+    if rec.part_index == 0:
+        if not chunks:
+            return _fail(store, rec, "there is no speech in that recording - "
+                                     "Hark needs someone reading out loud.")
+        minutes = max((payload.get("audio_duration") or 0) / 60.0, 0.5)
+        density = len(payload.get("text", "")) / minutes
+        if density < MIN_CHARS_PER_MINUTE:
+            return _fail(store, rec,
+                         f"that recording has very little speech in it "
+                         f"({density:.0f} characters a minute). Hark indexes "
+                         f"narration - music or ambience gives it nothing to answer from.")
+
+    offset = float(part.get("offset_s") or 0.0)
+    part_duration = float(t.get("audio_duration")
+                          or (chunks[-1].end_s if chunks else 0.0))
+    _absorb_part(store, rec, chunks, offset, t.get("chapters") or [])
+
+    part["duration_s"] = part_duration
+    part["done"] = True
+    rec.part_index += 1
+    rec.duration = offset + part_duration
+    if rec.part_index < len(rec.parts):
+        rec.parts[rec.part_index]["offset_s"] = rec.duration
+        save(store, rec)
+        print(f"[books] {rec.id}: part {rec.part_index}/{len(rec.parts)} absorbed, "
+              f"{rec.chunk_cursor} chunks so far")
+        return rec
+
+    # Every part is in. Flush whatever did not fill a final shard.
+    tail = json.loads(store.kv_get(_key(rec.id, "tail")) or "[]")
+    if tail:
+        store.kv_set(_key(rec.id, f"text:{rec.chunk_cursor // SLICE}"),
+                     json.dumps(tail), ttl=BOOK_TTL)
+    rec.n_chunks = rec.chunk_cursor + len(tail)
+    rec.status, rec.embedded = "indexing", 0
+    save(store, rec)
+    print(f"[books] {rec.id} transcribed: {rec.n_chunks} chunks "
+          f"across {len(rec.parts)} part(s), {rec.duration / 60:.0f} min")
+    return rec
+
+
+def _absorb_part(store, rec: BookRecord, chunks: List[Chunk],
+                 offset: float, aai_chapters: list) -> None:
+    """Fold one finished part into the growing index.
+
+    Text is written a shard at a time as it fills, so nothing has to hold a
+    whole book in memory or in one Redis value. Times are small enough to keep
+    as a single list and are read on every question, so they stay together.
+    """
+    if MAX_CHUNKS and rec.chunk_cursor >= MAX_CHUNKS:
+        return
+
+    times = json.loads(store.kv_get(_key(rec.id, "times")) or "[]")
+    times += [[round(c.start_s + offset, 2), round(c.end_s + offset, 2)] for c in chunks]
+    store.kv_set(_key(rec.id, "times"), json.dumps(times), ttl=BOOK_TTL)
+
+    tail = json.loads(store.kv_get(_key(rec.id, "tail")) or "[]")
+    tail += [c.text for c in chunks]
+    while len(tail) >= SLICE:
+        store.kv_set(_key(rec.id, f"text:{rec.chunk_cursor // SLICE}"),
+                     json.dumps(tail[:SLICE]), ttl=BOOK_TTL)
+        rec.chunk_cursor += SLICE
+        tail = tail[SLICE:]
+    store.kv_set(_key(rec.id, "tail"), json.dumps(tail), ttl=BOOK_TTL)
+
+    # AssemblyAI's own segmentation, shifted onto the book's timeline.
+    shifted = [
+        {"t": round((ch.get("start") or 0) / 1000.0 + offset, 1),
+         "title": (ch.get("headline") or ch.get("gist") or "").strip()[:70]}
+        for ch in aai_chapters if (ch.get("headline") or ch.get("gist"))
+    ]
+    if shifted:
+        have = json.loads(store.kv_get(_key(rec.id, "chapters")) or "[]")
+        store.kv_set(_key(rec.id, "chapters"), json.dumps(have + shifted), ttl=BOOK_TTL)
+
+
+def _chunks_from(payload: dict) -> List[Chunk]:
+    from hark.core.library import Library
+    return Library.chunks_from_transcript(payload)
+
+
+def _embed_slice(store, rec: BookRecord, embedder) -> BookRecord:
+    """Embed the next batch and write it as its own shard.
+
+    One slice per request is the whole trick: a ten-hour book is eighteen
+    Gemini calls, which would blow any request timeout done in one go, but is
+    eighteen quick polls when spread out -- and the browser gets a real
+    percentage out of it.
+    """
+    if embedder is None:
+        return _fail(store, rec, "embeddings are unavailable on this deployment")
+    n = rec.embedded // SLICE
+    texts = json.loads(store.kv_get(_key(rec.id, f"text:{n}")) or "[]")
+    if not texts:
+        rec.status = "ready"
+        save(store, rec)
+        return rec
+
+    vecs = embedder(texts, "document").astype("float32")
+    # Normalised at write time so a query is a plain dot product later.
+    vecs /= np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-9
+    store.kv_set(_key(rec.id, f"vecs:{n}"),
+                 base64.b64encode(vecs.astype(VEC_DTYPE).tobytes()).decode("ascii"),
+                 ttl=BOOK_TTL)
+
+    rec.embedded = min(rec.embedded + len(texts), rec.n_chunks)
+    if rec.embedded >= rec.n_chunks:
+        rec.status = "ready"
+        print(f"[books] {rec.id} ready: {rec.n_chunks} chunks")
+    save(store, rec)
+    return rec
+
+
+# ---------- reading it back ----------
+
+# A narrator announces structure out loud: "Section 8: On the Idea of Time in
+# Physics", "Chapter Eleven". That announcement is the only table of contents an
+# audiobook has, so it is what we read.
+_NUMBER = (r"\d{1,3}|[ivxlcdm]{1,7}|one|two|three|four|five|six|seven|eight|nine|ten|"
+           r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|"
+           r"nineteen|twenty|twenty[- ]\w+|thirty|forty|fifty")
+HEADING_RE = re.compile(
+    # A numbered heading must actually carry its number. Without that, "part of
+    # his intelligence" and "book of the law" read as chapter openings, which
+    # is how Pride and Prejudice ended up with a chapter called "Part: of his
+    # intelligence, though unheard by Lydia".
+    r"\b(?:(chapter|section|part|book|volume|act|scene|lecture|appendix)\s+"
+    rf"({_NUMBER})\b"
+    # These stand alone, because they are never numbered.
+    # The trailing \b matters: without it "prefaced his speech with a solemn
+    # bow" becomes a chapter called "Preface: d his speech with a solemn bow".
+    r"|(preface|introduction|prologue|epilogue|conclusion|foreword|afterword)\b)"
+    r"\s*[:.\-—]?\s*(.{0,60})", re.I)
+
+
+def stored_chapters(store, book_id: str) -> List[dict]:
+    """AssemblyAI's own segmentation, if this book was transcribed with it."""
+    raw = store.kv_get(_key(book_id, "chapters"))
+    if not raw:
+        return []
+    try:
+        return json.loads(raw)
+    except Exception:
+        return []
+
+
+def contents(lib) -> List[dict]:
+    """A table of contents, derived from what the reader says out loud.
+
+    An audiobook carries no chapter metadata -- the file is one opaque stream.
+    But the narrator announces each heading, so the transcript has them, and a
+    heading near the start of a chunk is almost always a real one rather than a
+    passing mention ("as I said in chapter three").
+
+    Falls back to even parts when a recording announces nothing, which is
+    better than an empty panel: it still lets someone jump around.
+    """
+    duration = lib.duration_hint()
+    if not duration:
+        return []
+    # Both Library and RedisLibrary answer window(), so one huge window is a
+    # portable way to walk every chunk without adding a method to either.
+    every = lib.window(duration / 2, before=duration, after=duration)
+    if not every:
+        return []
+
+    found, seen = [], set()
+    for c in every:
+        head = re.sub(r"\s+", " ", (c.text or "").strip())[:120]
+        # A chapter almost always opens with the previous one ending: "End of
+        # Section 7. Section 8: ...". Drop that, or we label the new chapter
+        # with the old one's number.
+        head = re.sub(r"^(?:end of\s+)[^.]{0,40}\.\s*", "", head, flags=re.I)
+        m = HEADING_RE.search(head)
+        # Only a heading that opens the chunk counts. Mid-paragraph references
+        # to other chapters are common and are not structure.
+        if not m or m.start() > 12:
+            continue
+
+        kind, number, standalone, rest = m.group(1), m.group(2), m.group(3), (m.group(4) or "")
+        # The title runs to the end of its own sentence, not for 60 characters.
+        rest = re.split(r"[.!?]", rest)[0].strip(" :;,-—")
+        label = f"{kind.title()} {number}" if kind else standalone.title()
+        if rest:
+            label += ": " + rest
+        label = label[:70].strip()
+
+        key = re.sub(r"[^a-z0-9]", "", label.lower())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        found.append({"t": round(c.start_s, 1), "title": label})
+
+    if len(found) >= 2:
+        return found[:60]
+
+    # Nothing announced: even parts, labelled with how they open.
+    n = min(8, max(2, len(every) // 4))
+    out = []
+    for i in range(n):
+        # A zero-width window at t=0 finds nothing when the first chunk starts
+        # a half-second in, which silently dropped "Part 1" off the front.
+        hits = lib.window(duration * i / n, before=0.0, after=2.0)
+        if not hits:
+            continue
+        opening = re.sub(r"\s+", " ", (hits[0].text or "")).strip()[:52]
+        out.append({"t": round(hits[0].start_s, 1),
+                    "title": f"Part {i + 1}", "hint": opening + "…"})
+    return out
+
+
+class RedisLibrary:
+    """A book held in Redis, with the same methods main.py calls on Library.
+
+    Reads are lazy and shard-scoped. Answering "what did that mean?" needs the
+    times plus one text shard; only a named-topic search pays for the vectors.
+    """
+
+    def __init__(self, store, rec: BookRecord):
+        self._store = store
+        self._rec = rec
+        self._times: Optional[List[List[float]]] = None
+        self._vectors: Optional[np.ndarray] = None
+        self._texts: dict = {}
+
+    # -- lazily loaded pieces --
+
+    def _load_times(self) -> List[List[float]]:
+        if self._times is None:
+            self._times = json.loads(self._store.kv_get(_key(self._rec.id, "times")) or "[]")
+        return self._times
+
+    def _text(self, chunk_id: int) -> str:
+        n = chunk_id // SLICE
+        if n not in self._texts:
+            self._texts[n] = json.loads(
+                self._store.kv_get(_key(self._rec.id, f"text:{n}")) or "[]")
+        shard = self._texts[n]
+        i = chunk_id % SLICE
+        return shard[i] if i < len(shard) else ""
+
+    def _load_vectors(self) -> Optional[np.ndarray]:
+        """Every shard in one round trip.
+
+        A long book is many shards, and fetching them one at a time is that
+        many sequential network calls inside a function the platform kills at
+        ten seconds. This is the only path that needs the whole index -- the
+        window lookup, which runs on every question, never comes here.
+        """
+        if self._vectors is None:
+            n_shards = (self._rec.n_chunks + SLICE - 1) // SLICE
+            keys = [_key(self._rec.id, f"vecs:{n}") for n in range(n_shards)]
+            blocks = []
+            for raw in self._store.kv_mget(keys):
+                if not raw:
+                    break
+                blocks.append(np.frombuffer(base64.b64decode(raw), dtype=VEC_DTYPE)
+                              .reshape(-1, DIM).astype("float32"))
+            self._vectors = np.vstack(blocks) if blocks else np.zeros((0, DIM), "float32")
+        return self._vectors
+
+    def _chunk(self, i: int) -> Chunk:
+        start, end = self._load_times()[i]
+        return Chunk(i, start, end, self._text(i))
+
+    # -- the Library surface --
+
+    def window(self, timestamp: float,
+               before: float = WINDOW_BEFORE_S,
+               after: float = WINDOW_AFTER_S) -> List[Chunk]:
+        lo, hi = timestamp - before, timestamp + after
+        ids = [i for i, (s, e) in enumerate(self._load_times()) if e >= lo and s <= hi]
+        return [self._chunk(i) for i in ids]
+
+    def search(self, query_vec: np.ndarray, k: int = 4,
+               before_s: Optional[float] = None) -> List[Chunk]:
+        vecs = self._load_vectors()
+        if vecs is None or not len(vecs):
+            return []
+        q = query_vec.astype("float32").ravel()
+        q /= np.linalg.norm(q) + 1e-9
+        scores = vecs @ q
+
+        if before_s is not None:
+            # The spoiler cap, same rule as the shipped book: nothing from
+            # further along than the listener has actually reached.
+            times = self._load_times()
+            mask = np.array([times[i][0] <= before_s for i in range(len(scores))])
+            scores = np.where(mask, scores, -np.inf)
+
+        k = min(k, int(np.isfinite(scores).sum()))
+        if k <= 0:
+            return []
+        top = np.argpartition(-scores, k - 1)[:k]
+        top = top[np.argsort(-scores[top])]
+        return [self._chunk(int(i)) for i in top]
+
+    def duration_hint(self) -> float:
+        if self._rec.duration:
+            return self._rec.duration
+        times = self._load_times()
+        return float(times[-1][1]) if times else 0.0
+
+    def __len__(self) -> int:
+        return self._rec.n_chunks

@@ -1,0 +1,22 @@
+.venv/
+/audio/
+__pycache__/
+*.pyc
+tests/
+hark/tools/probe_*.py
+hark/tools/bench_latency.py
+hark/tools/mic_check.py
+hark/tools/compare_rag.py
+hark/tools/ask.py
+hark/tools/run_demo.py
+hark/tools/make_demo_audiobook.py
+hark/tools/build_index.py
+hark/tools/check_keys.py
+data/*.transcript.json
+tests/
+
+# Video production and submission assets: never part of the app bundle
+/video/
+/submission/
+LAUNCH.md
+PROGRESS.md

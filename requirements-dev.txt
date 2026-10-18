@@ -1,0 +1,18 @@
+-r requirements.txt
+
+# --- local tooling: indexing, probes, the original desktop client ---
+assemblyai==1.3.0
+uvicorn[standard]==0.37.0
+sounddevice==0.5.1      # mic capture + playback (PortAudio)
+soundfile==0.12.1       # decode wav/flac/ogg
+elevenlabs==2.16.0
+pytest==9.1.1         # the test suite; needs no keys or hardware
+
+# --- local voice models (HARK_VOICE_PROVIDER=local) ---
+# Whistle (STT) and Needle (tool routing): one CPU engine, weights fetched from
+# Hugging Face on first use. Add [train] only if you need to slice finer rungs.
+cactus-needle==3.1.0
+# PocketTTS: CPU text-to-speech. Pulls PyTorch; on Windows/macOS the default
+# wheel is already CPU-only. On Linux add --extra-index-url
+# https://download.pytorch.org/whl/cpu to avoid the ~3 GB CUDA wheels.
+pocket-tts==3.3.0
