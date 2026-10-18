@@ -1572,13 +1572,66 @@ def health():
 
 # Committed audio is in public/audio (that is also what Vercel serves); local-only
 # titles stream from media/audio -- only that subfolder, so their indexes and
-# transcripts are never served. Range requests come free, which is what lets the
-# <audio> element seek.
+# transcripts are never served.
+#
+# Served by hand rather than StaticFiles: Cloud Run refuses any HTTP/1 response
+# over 32 MiB, and the <audio> element's first request is "Range: bytes=0-",
+# which StaticFiles answers with the whole file -- a 46 MB podcast came back as
+# a 500. A 206 may return less than was asked for, so ranges are capped and the
+# browser simply asks for the next piece; a request with no Range is streamed.
 AUDIO = ROOT / "public" / "audio"
+AUDIO_CHUNK = 4 * 1024 * 1024
+_AUDIO_TYPES = {".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".wav": "audio/wav",
+                ".ogg": "audio/ogg"}
+_RANGE = re.compile(r"bytes=(\d*)-(\d*)")
+
+
+def _audio_response(folder: Path, name: str, request: Request):
+    from fastapi.responses import Response, StreamingResponse
+    path = (folder / name).resolve()
+    kind = _AUDIO_TYPES.get(path.suffix.lower())
+    if not kind or path.parent != folder.resolve() or not path.is_file():
+        raise HTTPException(404)
+    size = path.stat().st_size
+    head = {"Accept-Ranges": "bytes", "Content-Type": kind,
+            "Cache-Control": "public, max-age=86400"}
+    m = _RANGE.fullmatch(request.headers.get("range", "").strip())
+    if not m or not (m.group(1) or m.group(2)):
+        if request.method == "HEAD":
+            return Response(headers={**head, "Content-Length": str(size)})
+
+        def chunks():
+            with open(path, "rb") as f:
+                while piece := f.read(256 * 1024):
+                    yield piece
+        return StreamingResponse(chunks(), headers=head, media_type=kind)
+    if m.group(1):
+        start = int(m.group(1))
+        end = int(m.group(2)) if m.group(2) else size - 1
+    else:                                     # "bytes=-N": the last N bytes
+        start, end = max(0, size - int(m.group(2))), size - 1
+    if start >= size or end < start:
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+    end = min(end, size - 1, start + AUDIO_CHUNK - 1)
+    head.update({"Content-Range": f"bytes {start}-{end}/{size}",
+                 "Content-Length": str(end - start + 1)})
+    if request.method == "HEAD":
+        return Response(status_code=206, headers=head)
+    with open(path, "rb") as f:
+        f.seek(start)
+        body = f.read(end - start + 1)
+    return Response(content=body, status_code=206, headers=head)
+
+
 if AUDIO.exists():
-    app.mount("/audio", StaticFiles(directory=str(AUDIO)), name="audio")
+    @app.api_route("/audio/{name}", methods=["GET", "HEAD"])
+    def committed_audio(name: str, request: Request):
+        return _audio_response(AUDIO, name, request)
+
 if (MEDIA / "audio").exists():
-    app.mount("/media", StaticFiles(directory=str(MEDIA / "audio")), name="media")
+    @app.api_route("/media/{name}", methods=["GET", "HEAD"])
+    def local_media(name: str, request: Request):
+        return _audio_response(MEDIA / "audio", name, request)
 
 if WEB.exists():
     app.mount("/static", StaticFiles(directory=str(WEB)), name="static")
