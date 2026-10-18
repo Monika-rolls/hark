@@ -258,7 +258,7 @@ def new_session(request: Request, provider: Optional[str] = None,
     the models on this machine, so the browser connects to our own websocket
     (`/ws/voice`) instead and no vendor key or credit is involved -- which is
     also why the judges' access code is not required for a local session. The
-    local answer model (`llm`: gemini or qwen) also rides here.
+    local answer model (`llm`: gemini or gemma) also rides here.
     """
     chosen = (provider or VOICE_PROVIDER or "assemblyai").strip().lower()
     session_id = f"s{int(time.time()*1000)}{os.urandom(3).hex()}"
@@ -656,8 +656,8 @@ _SENTENCE_END = re.compile(r"[.!?](?:\s|$)")
 def local_answer_stream(question: str, tool_message: str, llm: Optional[str] = None):
     """Yield the spoken reply sentence by sentence as the answer model writes it.
 
-    The model is chosen per session -- Gemini in the cloud, or a local llama.cpp
-    Qwen (see hark/server/local_llm.py) -- and streams its text, so the first sentence
+    The model is chosen per session -- Gemini in the cloud, or Gemma on a local
+    llama.cpp server (see hark/server/local_llm.py) -- and streams its text, so the first sentence
     can be spoken while the rest is still being generated.
     """
     model = local_llm.build_answer_model(llm)
@@ -666,7 +666,7 @@ def local_answer_stream(question: str, tool_message: str, llm: Optional[str] = N
     prompt = (f"The listener just interrupted the book and said:\n{question}\n\n"
               f"TOOL RESULT (their position and the relevant passage):\n{tool_message}\n\n"
               f"Answer them now, following the rules.")
-    system = _local_system_prompt(short=getattr(model, "name", "") == "qwen")
+    system = _local_system_prompt(short=getattr(model, "name", "") == "gemma")
     buf = ""
     for piece in model.stream(prompt, system):
         buf += piece

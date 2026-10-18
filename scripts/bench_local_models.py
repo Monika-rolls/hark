@@ -5,18 +5,17 @@ Measures, on this machine:
   whistle  speech to text, at three clip lengths -- cold, then warm
   needle   tool routing, per query -- cold, then warm
   gemini   the default answer model: time to first sentence, and total
-  qwen     a local llama.cpp answer model, if one is serving (see below)
+  gemma    Google's Gemma on a local llama.cpp server, if one is serving (see below)
   pocket   text to speech: full synthesis, and time to the first audio chunk
 
 Run it:
 
     python scripts/bench_local_models.py --runs 3
 
-To include Qwen, start a llama.cpp server first and point the env at it:
+To include Gemma, start a llama.cpp server first (it serves on
+http://127.0.0.1:8081/v1, where the app looks by default):
 
-    llama-server -m qwen2.5-1.5b-instruct-q4_k_m.gguf --port 8080
-    set HARK_LOCAL_LLM_BASE_URL=http://127.0.0.1:8080/v1
-    set HARK_LOCAL_LLM_MODEL=qwen2.5-1.5b-instruct
+    .\scripts\start_local_llm.ps1
 """
 import argparse
 import statistics
@@ -114,7 +113,7 @@ def bench_answer(runs: int):
             "last 90 seconds):\n" + passage)
     question = "wait, what did that last sentence mean?"
     print(f"  backend        available   to 1st sentence   total")
-    for name in ("gemini", "qwen"):
+    for name in ("gemini", "gemma"):
         available = local_llm.available_llms().get(name)
         if not available:
             print(f"  {name:12s}  no{'':10s}  (skipped)")

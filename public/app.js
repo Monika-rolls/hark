@@ -610,8 +610,9 @@ function buildAnswerMode() {
 
 let voiceProvider = storageGet("hark:voiceprovider", null);
 let localModels = null;
-// Which model writes the answer, in local mode: "gemini" (cloud) or "qwen"
-// (a local llama.cpp server). Only meaningful when the voice engine is local.
+// Which model writes the answer, in local mode: "gemini" (cloud) or "gemma"
+// (a local llama.cpp server; a saved "qwen" from before means the same).
+// Only meaningful when the voice engine is local.
 let answerModel = storageGet("hark:answerModel", null);
 let localLlms = null;
 // Which engine the *running* session actually uses. The toggle only decides the
@@ -653,7 +654,7 @@ function applyVoiceProvider(name) {
 }
 
 function applyAnswerModel(name) {
-  answerModel = name === "qwen" ? "qwen" : "gemini";
+  answerModel = name === "gemma" || name === "qwen" ? "gemma" : "gemini";
   storageSet("hark:answerModel", answerModel);
   const group = el("llmengine");
   if (group) group.querySelectorAll("button").forEach((b) => {
@@ -661,9 +662,9 @@ function applyAnswerModel(name) {
   });
   const note = el("llmnote");
   if (!note) return;
-  if (answerModel === "qwen" && localLlms && localLlms.qwen === false) {
+  if (answerModel === "gemma" && localLlms && localLlms.gemma === false) {
     note.hidden = false;
-    note.textContent = "Qwen is not reachable. Start it with: llama-server -m qwen2.5-1.5b-instruct-q4_k_m.gguf --port 8080";
+    note.textContent = "Gemma is not reachable. Start it with: scripts/start_local_llm.ps1";
   } else {
     note.hidden = true;
   }

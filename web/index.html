@@ -410,10 +410,10 @@
         <button type="button" data-engine="local" role="radio" aria-checked="false">Local &mdash; this machine</button>
       </div>
       <!-- Only in local mode: which model writes the spoken answer. Gemini is a
-           cloud call; Qwen runs on a local llama.cpp server. -->
+           cloud call; Gemma runs on a local llama.cpp server. -->
       <div class="choice" id="llmengine" role="radiogroup" aria-label="Which model writes the answer" hidden>
         <button type="button" data-llm="gemini" role="radio" aria-checked="true">Answer: Gemini &mdash; cloud</button>
-        <button type="button" data-llm="qwen" role="radio" aria-checked="false">Answer: Qwen &mdash; local (llama.cpp)</button>
+        <button type="button" data-llm="gemma" role="radio" aria-checked="false">Answer: Gemma &mdash; local (llama.cpp)</button>
       </div>
       <p class="micnote" id="llmnote" hidden></p>
       <p class="micnote" id="localnote" hidden></p>

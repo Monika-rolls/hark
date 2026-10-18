@@ -28,7 +28,7 @@ data/.spend_cache.json
 # Video production files (includes a voice clone), not for the public repo
 video/
 
-# Local answer-model weights (Qwen GGUF for llama.cpp). Gigabytes; never commit.
+# Local answer-model weights (Gemma GGUF for llama.cpp). Gigabytes; never commit.
 /models/
 
 

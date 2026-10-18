@@ -274,13 +274,17 @@ def test_the_local_websocket_speaks_the_assemblyai_wire_protocol(monkeypatch):
 def test_the_answer_model_choice_defaults_and_selects(monkeypatch):
     monkeypatch.delenv("HARK_LOCAL_LLM", raising=False)
     assert local_llm.default_llm() == "gemini"
+    monkeypatch.setenv("HARK_LOCAL_LLM", "gemma")
+    assert local_llm.default_llm() == "gemma"
+    # The backend was Qwen before; old settings still reach the same server.
     monkeypatch.setenv("HARK_LOCAL_LLM", "qwen")
-    assert local_llm.default_llm() == "qwen"
+    assert local_llm.default_llm() == "gemma"
     monkeypatch.setenv("HARK_LOCAL_LLM", "nonsense")
     assert local_llm.default_llm() == "gemini"
-    # Qwen builds even when the probe fails (a slow server should not silently
+    # Gemma builds even when the probe fails (a slow server should not silently
     # downgrade the answer); Gemini needs a key.
-    assert local_llm.build_answer_model("qwen").name == "qwen"
+    assert local_llm.build_answer_model("gemma").name == "gemma"
+    assert local_llm.build_answer_model("qwen").name == "gemma"
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     assert local_llm.build_answer_model("gemini") is None
 

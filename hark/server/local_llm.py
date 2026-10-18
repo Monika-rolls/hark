@@ -5,9 +5,10 @@ machine; only the answer text has been a network call. Two backends fill that
 slot:
 
   gemini  -- Google's API, the default, and the same model the cloud path uses.
-  qwen    -- a local llama.cpp `llama-server` (or anything OpenAI-compatible),
-             which takes the last cloud hop out of the loop. Qwen 0.5B/1.5B
-             GGUF is the intended target.
+  gemma   -- Google's open Gemma on a local llama.cpp `llama-server` (or
+             anything OpenAI-compatible), which takes the last cloud hop out of
+             the loop. Gemma 3 1B instruct, Q4_K_M GGUF, is the intended target.
+             "qwen" is still accepted as an alias for this backend.
 
 Both are streaming: they yield text pieces as the model writes, and the caller
 turns those into sentences so the first one can be spoken while the rest is
@@ -37,18 +38,28 @@ def _transient(exc: Exception) -> bool:
     return any(marker in message for marker in _TRANSIENT)
 
 
+# The local backend was Qwen before it was Gemma; old settings and saved page
+# choices still say "qwen", and mean the same llama.cpp server.
+_ALIASES = {"qwen": "gemma"}
+
+
+def normalize_llm(name: Optional[str]) -> str:
+    name = (name or "").strip().lower()
+    name = _ALIASES.get(name, name)
+    return name if name in ("gemini", "gemma") else "gemini"
+
+
 def default_llm() -> str:
-    name = (os.getenv("HARK_LOCAL_LLM", "") or "gemini").strip().lower()
-    return name if name in ("gemini", "qwen") else "gemini"
+    return normalize_llm(os.getenv("HARK_LOCAL_LLM", "") or "gemini")
 
 
-def _qwen_base() -> str:
+def _local_base() -> str:
     return (os.getenv("HARK_LOCAL_LLM_BASE_URL", "")
-            or "http://127.0.0.1:8080/v1").rstrip("/")
+            or "http://127.0.0.1:8081/v1").rstrip("/")
 
 
-def _qwen_model() -> str:
-    return os.getenv("HARK_LOCAL_LLM_MODEL", "") or "qwen2.5-1.5b-instruct"
+def _local_model() -> str:
+    return os.getenv("HARK_LOCAL_LLM_MODEL", "") or "gemma-3-1b-it"
 
 
 class GeminiAnswer:
@@ -104,7 +115,7 @@ class GeminiAnswer:
                 time.sleep(0.7 * (attempt + 1))
 
 
-class QwenAnswer:
+class GemmaAnswer:
     """A local llama.cpp `llama-server`, spoken to over its OpenAI-compatible API.
 
     `stream=True` gives server-sent events, so the reply can be spoken sentence
@@ -112,12 +123,12 @@ class QwenAnswer:
     `/v1/chat/completions` endpoint works.
     """
 
-    name = "qwen"
+    name = "gemma"
 
     def __init__(self, base_url: Optional[str] = None, model: Optional[str] = None,
                  api_key: Optional[str] = None):
-        self._base = (base_url or _qwen_base()).rstrip("/")
-        self._model = model or _qwen_model()
+        self._base = (base_url or _local_base()).rstrip("/")
+        self._model = model or _local_model()
         self._key = api_key if api_key is not None else os.getenv("HARK_LOCAL_LLM_API_KEY", "")
 
     def _headers(self) -> dict:
@@ -178,7 +189,7 @@ class QwenAnswer:
                             yield piece
                 return
             except Exception as exc:
-                print(f"[llm] qwen attempt {attempt + 1} failed: {exc}")
+                print(f"[llm] gemma attempt {attempt + 1} failed: {exc}")
                 if started or not _transient(exc):
                     return
                 time.sleep(0.5)
@@ -186,15 +197,15 @@ class QwenAnswer:
 
 def build_answer_model(name: Optional[str] = None):
     """The answer model to use, or None if the chosen one cannot run here."""
-    chosen = (name or default_llm()).strip().lower()
-    if chosen == "qwen":
+    chosen = normalize_llm(name) if name else default_llm()
+    if chosen == "gemma":
         # Returned even if the probe failed: a server that is merely slow to
         # start should not silently downgrade the answer to the passage.
-        return QwenAnswer()
+        return GemmaAnswer()
     model = GeminiAnswer()
     return model if model.available() else None
 
 
 def available_llms() -> dict:
-    """What the page can offer. Gemini needs a key; Qwen needs a live server."""
-    return {"gemini": GeminiAnswer().available(), "qwen": QwenAnswer().available()}
+    """What the page can offer. Gemini needs a key; Gemma needs a live server."""
+    return {"gemini": GeminiAnswer().available(), "gemma": GemmaAnswer().available()}

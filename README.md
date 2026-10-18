@@ -285,12 +285,19 @@ AssemblyAI's cloud. Choose **Local — this machine** under *Voice engine*, or s
 |---|---|---|
 | Speech to text | **Whistle** (16.9 MB, CPU) | 16 kHz mono; not streaming, so `local_voice.Endpointer` cuts a turn at the silent gap |
 | Tool routing | **Needle 3** (35 MB, CPU — tool calls only) | picks `passage_at_playhead` / `go_to_topic` / `book_outline` |
-| Answer text | **Gemini** (cloud) *or* **Qwen** on a local llama.cpp server | two options in the panel; Needle emits tool calls, never prose, so something has to write the spoken reply |
+| Answer text | **Gemini** (cloud) *or* **Gemma 3 1B** on a local llama.cpp server | two options in the panel; Needle emits tool calls, never prose, so something has to write the spoken reply |
 | Text to speech | **PocketTTS** (~100 M, CPU) | 24 kHz out |
 
-The answer model is a per-session choice: **Gemini** (a cloud call) or **Qwen**
-on a local `llama-server` (`HARK_LOCAL_LLM=qwen`,
+The answer model is a per-session choice: **Gemini** (a cloud call) or **Gemma**
+on a local `llama-server` (`HARK_LOCAL_LLM=gemma`,
 `HARK_LOCAL_LLM_BASE_URL=…`), which takes the last cloud hop out of the loop.
+Start it with `scripts/start_local_llm.ps1`, which serves
+`models/gemma-3-1b-it-Q4_K_M.gguf` on port 8081:
+
+```powershell
+curl.exe -L -o models\gemma-3-1b-it-Q4_K_M.gguf https://huggingface.co/ggml-org/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q4_K_M.gguf
+.\scripts\start_local_llm.ps1
+```
 `scripts/bench_local_models.py` times every stage — STT, routing, the answer
 model, and TTS — cold and warm.
 
