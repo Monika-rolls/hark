@@ -56,6 +56,8 @@ from .local_voice import (CONTENTLESS, HALLUCINATIONS, MIN_UTTERANCE_S, STT_RATE
                           WIRE_RATE, DEFAULT_TTS_VOICE, TTS_VOICES, Endpointer,
                           LocalVoice, new_speech_detector, pcm16_to_float,
                           resample, tts_voice, vad_enabled)
+from .google_voice import (DEFAULT_GOOGLE_VOICE, GOOGLE_TTS_VOICES, GoogleVoice,
+                           google_voice)
 from .store import build_store
 
 load_dotenv()
@@ -163,6 +165,8 @@ playheads = build_store()
 # the weights are fetched on first use -- so this is safe on a host (Vercel)
 # that will never touch the local path.
 local_voice = LocalVoice()
+# The all-Google engine: Speech-to-Text, Gemini, Text-to-Speech. Same interface.
+google_engine = GoogleVoice()
 
 
 def library_for(session_id: Optional[str]):
@@ -344,6 +348,17 @@ def new_session(request: Request, provider: Optional[str] = None,
     """
     chosen = (provider or VOICE_PROVIDER or "assemblyai").strip().lower()
     session_id = f"s{int(time.time()*1000)}{os.urandom(3).hex()}"
+
+    if chosen == "google":
+        return {
+            "provider": "google",
+            "session_id": session_id,
+            "ws_path": "/ws/voice/google",
+            "llm": "gemini",
+            "book": BOOK,
+            "duration": library.duration_hint(),
+            "models": google_engine.status(),
+        }
 
     if chosen == "local":
         return {
@@ -1057,11 +1072,11 @@ MIN_VOICED_S = 0.45
 
 
 async def _partial_transcript(ws: WebSocket, endpointer, generation: int,
-                              audio: np.ndarray) -> None:
+                              audio: np.ndarray, stt=None) -> None:
     """Transcribe the turn so far and show it; dropped if the turn has moved on."""
     try:
         text = (await run_in_threadpool(
-            local_voice.stt.transcribe, resample(audio, WIRE_RATE, STT_RATE)) or "").strip()
+            (stt or local_voice.stt).transcribe, resample(audio, WIRE_RATE, STT_RATE)) or "").strip()
         if text and endpointer.generation == generation:
             await ws.send_json({"type": "transcript.user.delta", "text": text})
     except Exception as exc:
@@ -1069,7 +1084,7 @@ async def _partial_transcript(ws: WebSocket, endpointer, generation: int,
 
 
 async def _stream_reply(ws: WebSocket, sentences, holder: dict,
-                        voice: Optional[str] = None) -> None:
+                        voice: Optional[str] = None, tts=None) -> None:
     """Speak a reply while it is still being written.
 
     `sentences` is a lazy iterable of the reply's sentences (Gemini's stream)
@@ -1083,6 +1098,7 @@ async def _stream_reply(ws: WebSocket, sentences, holder: dict,
     loop = asyncio.get_running_loop()
     queue: "asyncio.Queue" = asyncio.Queue()
     done = object()
+    tts = tts or local_voice.tts
 
     def emit(kind, payload):
         loop.call_soon_threadsafe(queue.put_nowait, (kind, payload))
@@ -1094,7 +1110,7 @@ async def _stream_reply(ws: WebSocket, sentences, holder: dict,
                 parts.append(sentence)
                 holder["text"] = " ".join(parts).strip()
                 emit("text", sentence)
-                for chunk in local_voice.tts.stream(sentence, voice=voice):
+                for chunk in tts.stream(sentence, voice=voice):
                     emit("audio", chunk)
         except Exception as exc:
             print(f"[local] reply stream failed: {exc}")
@@ -1105,7 +1121,7 @@ async def _stream_reply(ws: WebSocket, sentences, holder: dict,
             # past the fallback entirely, leaving the reply silent.
             if not parts:
                 try:
-                    emit("audio", local_voice.tts.speak(holder.get("fallback", ""), voice=voice))
+                    emit("audio", tts.speak(holder.get("fallback", ""), voice=voice))
                 except Exception as exc2:
                     print(f"[local] tts failed entirely: {exc2}")
             loop.call_soon_threadsafe(queue.put_nowait, done)
@@ -1133,18 +1149,33 @@ async def warm_local():
 @app.websocket("/ws/voice")
 async def voice_socket(ws: WebSocket):
     """The local equivalent of the AssemblyAI Voice Agent websocket."""
+    await _voice_session(ws, "local")
+
+
+@app.websocket("/ws/voice/google")
+async def google_voice_socket(ws: WebSocket):
+    """The same loop on Google's models: Speech-to-Text, Gemini, Text-to-Speech."""
+    await _voice_session(ws, "google")
+
+
+async def _voice_session(ws: WebSocket, kind: str):
     await ws.accept()
+    google = kind == "google"
+    # Looked up per session, so tests can swap the local models out.
+    engine = google_engine if google else local_voice
     sid = ws.query_params.get("session_id")
-    llm = ws.query_params.get("llm")
+    llm = "gemini" if google else ws.query_params.get("llm")
     if ws.query_params.get("tools_off") is not None:
         _set_tools_off(sid, ws.query_params.get("tools_off", "").split(","))
     # Allowlisted: an unknown voice is the default, never a URL to fetch.
-    voice = tts_voice(ws.query_params.get("voice"))
+    voice = (google_voice if google else tts_voice)(ws.query_params.get("voice"))
     await ws.send_json({"type": "session.ready", "session_id": sid, "llm": llm,
-                        "voice": voice})
+                        "voice": voice, "engine": kind})
     # Silero takes ~0.3 s to load; pay it off the event loop.
     endpointer = Endpointer(WIRE_RATE, vad=await run_in_threadpool(new_speech_detector))
-    partials = os.getenv("HARK_STT_PARTIALS", "1") != "0"
+    # Partials re-transcribe the turn every second: free on the machine, a
+    # billed request each time on Google, so the Google engine skips them.
+    partials = os.getenv("HARK_STT_PARTIALS", "1") != "0" and not google
     partial_task = None
     last_partial = 0.0
     try:
@@ -1166,7 +1197,7 @@ async def voice_socket(ws: WebSocket):
                     if audio is not None and len(audio) >= PARTIAL_MIN_S * WIRE_RATE:
                         last_partial = time.monotonic()
                         partial_task = asyncio.create_task(_partial_transcript(
-                            ws, endpointer, endpointer.generation, audio))
+                            ws, endpointer, endpointer.generation, audio, engine.stt))
                 continue
             kind, audio = event
             if kind == "start":
@@ -1192,7 +1223,7 @@ async def voice_socket(ws: WebSocket):
                 print(f"[local] dropped: only {endpointer.last_voiced_s:.2f}s of speech")
                 await ws.send_json({"type": "reply.done", "status": "dropped"})
                 continue
-            text = (await run_in_threadpool(local_voice.stt.transcribe, audio16) or "").strip()
+            text = (await run_in_threadpool(engine.stt.transcribe, audio16) or "").strip()
             print(f"[local] heard: {text!r}")
             if not text:
                 await ws.send_json({"type": "reply.done", "status": "dropped"})
@@ -1226,7 +1257,7 @@ async def voice_socket(ws: WebSocket):
             else:
                 if pending:
                     playheads.kv_set(quiz_key, "", ttl=1)
-                name, args = await run_in_threadpool(local_voice.router.route, text)
+                name, args = await run_in_threadpool(engine.router.route, text)
                 if name in _tools_off(sid):
                     print(f"[local] {name} is switched off; answering from the passage")
                     name, args = "passage_at_playhead", {}
@@ -1248,7 +1279,7 @@ async def voice_socket(ws: WebSocket):
             # while the rest is still being generated.
             holder = {"text": "", "fallback": _fallback_answer(result)}
             sentences = local_answer_stream(text, result.get("message", ""), llm)
-            await _stream_reply(ws, sentences, holder, voice)
+            await _stream_reply(ws, sentences, holder, voice, engine.tts)
             print(f"[local] answered in {time.monotonic() - started:.1f}s "
                   f"({len(holder['text'])} chars)")
             if name == "quiz_me" and not args.get("answer") and holder["text"] and sid:
@@ -1580,6 +1611,9 @@ def health():
             "tools": [{"id": tid, "label": lbl, "description": desc, "always_on": always}
                       for tid, lbl, desc, always in TOOL_CATALOG],
             "tts_voice_default": DEFAULT_TTS_VOICE,
+            "google_voice": {"available": google_engine.available(), **google_engine.status()},
+            "google_tts_voices": [{"id": v, "label": v} for v in GOOGLE_TTS_VOICES],
+            "google_tts_voice_default": DEFAULT_GOOGLE_VOICE,
             "vad": "silero" if vad_enabled() else "energy",
             "local_llms": local_llm.available_llms()}
 

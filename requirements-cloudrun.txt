@@ -5,3 +5,8 @@ uvicorn[standard]==0.37.0
 cactus-needle==3.1.0
 pocket-tts==3.3.0
 silero-vad==6.2.3
+
+# The all-Google voice engine (/ws/voice/google): Speech-to-Text (Chirp) and
+# Text-to-Speech (Chirp 3 HD). Gemini comes from google-genai in requirements.txt.
+google-cloud-speech==2.41.0
+google-cloud-texttospeech==2.38.0
