@@ -1649,6 +1649,10 @@ if (MEDIA / "audio").exists():
     def local_media(name: str, request: Request):
         return _audio_response(MEDIA / "audio", name, request)
 
+IMAGES = ROOT / "public" / "images"
+if IMAGES.exists():
+    app.mount("/images", StaticFiles(directory=str(IMAGES)), name="images")
+
 if WEB.exists():
     app.mount("/static", StaticFiles(directory=str(WEB)), name="static")
 

@@ -5,6 +5,7 @@
   ],
   "routes": [
     { "src": "/audio/(.*)", "dest": "/public/audio/$1" },
+    { "src": "/images/(.*)", "dest": "/public/images/$1" },
     { "src": "/static/(.*)", "dest": "/public/$1" },
     { "src": "/", "dest": "/public/index.html" },
     { "src": "/(.*)", "dest": "api/index.py" }
