@@ -209,3 +209,77 @@ def build_answer_model(name: Optional[str] = None):
 def available_llms() -> dict:
     """What the page can offer. Gemini needs a key; Gemma needs a live server."""
     return {"gemini": GeminiAnswer().available(), "gemma": GemmaAnswer().available()}
+
+
+_search_client = None
+
+
+def _grounding_client():
+    """Vertex AI when HARK_VERTEX_PROJECT is set, else the Gemini API key.
+
+    Grounding with Google Search is metered separately from plain Gemini, and an
+    AI Studio free-tier key may have none of it. On Cloud Run, Vertex AI bills
+    the project and authenticates as the service account -- no key involved.
+    """
+    global _search_client
+    project = os.getenv("HARK_VERTEX_PROJECT", "").strip()
+    if not project:
+        return GeminiAnswer()._client_or_none()
+    if _search_client is None:
+        from google import genai
+        _search_client = genai.Client(
+            vertexai=True, project=project,
+            location=os.getenv("HARK_VERTEX_LOCATION", "global").strip() or "global")
+    return _search_client
+
+
+def google_search(query: str, context: str = "") -> Optional[dict]:
+    """Answer a question from the live web, via Gemini grounded on Google Search.
+
+    For what the book cannot answer: a fact it assumes, whether something is
+    still true today, the latest on a topic. Returns {"text", "sources"} with
+    sources as (title, url) pairs, or None when there is no key or the call
+    fails -- the caller says so rather than inventing an answer.
+    """
+    try:
+        client = _grounding_client()
+    except Exception as exc:
+        print(f"[search] no search client: {exc}")
+        return None
+    if client is None or not (query or "").strip():
+        return None
+    from hark.core.brain import CHAT_MODEL, THINKING_BUDGET
+    from google.genai import types
+    about = f" They are listening to: {context}." if context else ""
+    try:
+        resp = client.models.generate_content(
+            model=os.getenv("HARK_LOCAL_CHAT_MODEL", "") or CHAT_MODEL,
+            contents=f"Question:{about} {query}",
+            config=types.GenerateContentConfig(
+                system_instruction=(
+                    "Search the web and answer the question in at most four plain "
+                    "sentences, suitable to be read aloud. State facts, no lists, "
+                    "no markdown. If the sources disagree or are unclear, say so."),
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+                temperature=0.2,
+                thinking_config=types.ThinkingConfig(thinking_budget=THINKING_BUDGET),
+            ),
+        )
+    except Exception as exc:
+        print(f"[search] google search failed: {exc}")
+        return None
+    text = (getattr(resp, "text", "") or "").strip()
+    if not text:
+        return None
+    sources = []
+    try:
+        meta = resp.candidates[0].grounding_metadata
+        for chunk in (getattr(meta, "grounding_chunks", None) or []):
+            web = getattr(chunk, "web", None)
+            if web and getattr(web, "uri", None):
+                pair = ((web.title or "").strip() or "source", web.uri)
+                if pair not in sources:
+                    sources.append(pair)
+    except (AttributeError, IndexError, TypeError):
+        pass
+    return {"text": text, "sources": sources[:5]}

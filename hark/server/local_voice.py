@@ -396,6 +396,31 @@ class NeedleRouter:
             ],
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
+        {
+            "name": "web_search",
+            "description": (
+                "Search the internet for things the book cannot answer: a general "
+                "fact, a definition, the latest research, or whether something is "
+                "still true today. Use when they say 'look up', 'search', 'online', "
+                "'nowadays' or 'in general'."
+            ),
+            "triggers": [
+                r"\b(look (it|that|this)? ?up|search|google)\b",
+                r"\b(online|on the (web|internet))\b",
+                r"\b(still true|nowadays|these days|today|latest|currently)\b",
+                r"\bin general\b",
+            ],
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What to search for, as a short web query.",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
     ]
 
     def __init__(self, weights: Optional[str] = None):
@@ -435,14 +460,32 @@ class NeedleRouter:
         return "passage_at_playhead", {}
 
 
+# PocketTTS's built-in English voices the listener may pick from. An allowlist,
+# not a passthrough: PocketTTS also accepts arbitrary http:// and hf:// URLs as
+# a voice, and a query parameter must never be able to make the server fetch one.
+TTS_VOICES = {
+    "alba": "Alba", "anna": "Anna", "vera": "Vera", "mary": "Mary", "jane": "Jane",
+    "eve": "Eve", "charles": "Charles", "george": "George", "paul": "Paul",
+    "michael": "Michael", "jean": "Jean", "marius": "Marius",
+}
+DEFAULT_TTS_VOICE = "alba"
+
+
+def tts_voice(name: Optional[str]) -> str:
+    """The voice to use for a request: a known id, else the default."""
+    name = (name or "").strip().lower()
+    return name if name in TTS_VOICES else DEFAULT_TTS_VOICE
+
+
 class PocketTtsSpeaker:
     """PocketTTS, kept in memory. Text in, 24 kHz PCM16 out for the browser."""
 
-    def __init__(self, voice: str = "alba", language: str = "english"):
+    def __init__(self, voice: str = DEFAULT_TTS_VOICE, language: str = "english"):
         self._voice = voice
         self._language = language
         self._model = None
         self._state = None
+        self._states: dict = {}
         self._rate = WIRE_RATE
 
     def available(self) -> bool:
@@ -470,22 +513,33 @@ class PocketTtsSpeaker:
             self._model = model
             self._rate = int(getattr(model, "sample_rate", WIRE_RATE) or WIRE_RATE)
             self._state = model.get_state_for_audio_prompt(self._voice)
+            self._states[self._voice] = self._state
         return self._model
 
-    def speak(self, text: str) -> bytes:
+    def _voice_state(self, voice: Optional[str]):
+        """The prompt state for a voice, computed once and kept (~a second each)."""
+        self._load()
+        voice = tts_voice(voice) if voice else self._voice
+        if voice not in self._states:
+            with _MODEL_LOCK:
+                self._states[voice] = self._model.get_state_for_audio_prompt(voice)
+        return self._states[voice]
+
+    def speak(self, text: str, voice: Optional[str] = None) -> bytes:
         """Synthesize one reply; return PCM16 at the browser's rate."""
         text = (text or "").strip()
         if not text:
             return b""
         model = self._load()
+        state = self._voice_state(voice)
         with _MODEL_LOCK:
-            audio = model.generate_audio(self._state, text)
+            audio = model.generate_audio(state, text)
         samples = _tensor_to_numpy(audio)
         if self._rate != WIRE_RATE:
             samples = resample(samples, self._rate, WIRE_RATE)
         return float_to_pcm16(samples)
 
-    def stream(self, text: str):
+    def stream(self, text: str, voice: Optional[str] = None):
         """Yield PCM16 at the wire rate as PocketTTS produces it.
 
         Waiting for the whole reply to synthesize before sending the first byte
@@ -496,8 +550,9 @@ class PocketTtsSpeaker:
         if not text:
             return
         model = self._load()
+        state = self._voice_state(voice)
         with _MODEL_LOCK:
-            for chunk in model.generate_audio_stream(self._state, text):
+            for chunk in model.generate_audio_stream(state, text):
                 samples = _tensor_to_numpy(chunk)
                 if self._rate != WIRE_RATE:
                     samples = resample(samples, self._rate, WIRE_RATE)

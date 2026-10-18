@@ -53,8 +53,9 @@ from hark.core.library import Library
 
 from . import books, local_llm
 from .local_voice import (CONTENTLESS, HALLUCINATIONS, MIN_UTTERANCE_S, STT_RATE,
-                          WIRE_RATE, Endpointer, LocalVoice, new_speech_detector,
-                          pcm16_to_float, resample, vad_enabled)
+                          WIRE_RATE, DEFAULT_TTS_VOICE, TTS_VOICES, Endpointer,
+                          LocalVoice, new_speech_detector, pcm16_to_float,
+                          resample, tts_voice, vad_enabled)
 from .store import build_store
 
 load_dotenv()
@@ -598,6 +599,45 @@ def tool_outline(session_id: Optional[str]) -> dict:
         f"story, do not give away how it ends.\n\n{_length_rule(session_id)}")}
 
 
+class WebSearchCall(BaseModel):
+    session_id: Optional[str] = None
+    query: Optional[str] = None
+
+
+@app.post("/tools/web_search")
+def web_search(call: WebSearchCall, request: Request):
+    """Look something up on the live web, for what the book cannot answer."""
+    sid = _tool_session(call.session_id, request)
+    _note_tool(sid, "web_search", {"query": call.query or ""})
+    return tool_web_search(sid, call.query)
+
+
+def tool_web_search(session_id: Optional[str], query: Optional[str]) -> dict:
+    """Google Search, grounded through Gemini, phrased for the agent to speak.
+
+    The book is the source of truth for what was said; the web is for what the
+    book assumes or cannot know -- a definition, the latest research, whether a
+    claim still holds. The answer is labelled as coming from the web.
+    """
+    query = (query or "").strip()[:300]
+    if not query:
+        return {"ok": False, "message": "There was nothing to look up. Ask them what "
+                                         "they would like searched."}
+    _, title = library_for(session_id)
+    found = local_llm.google_search(query, context=title)
+    if not found:
+        return {"ok": False, "message": (
+            "Web search is not available right now. Say you could not check online, "
+            "and answer from the book if it covers the question.")}
+    names = ", ".join(t for t, _ in found["sources"][:3]) or "the web"
+    return {"ok": True, "message": (
+        f"Google Search results for \"{query}\":\n{found['text']}\n\n"
+        f"Sources: {names}\n\n"
+        f"Answer from these results, and say it comes from the web, not the book "
+        f"(name one source).\n\n{_length_rule(session_id)}"),
+        "sources": [{"title": t, "url": u} for t, u in found["sources"]]}
+
+
 def _length_rule(session_id: Optional[str]) -> str:
     """How long the answer should be, as a line the agent will read.
 
@@ -764,6 +804,8 @@ def run_local_tool(session_id: Optional[str], name: str, args: dict) -> dict:
         return tool_go_to_topic(session_id, str(args.get("topic", "")).strip())
     if name == "book_outline":
         return tool_outline(session_id)
+    if name == "web_search":
+        return tool_web_search(session_id, str(args.get("query", "")).strip())
     return tool_passage(session_id, args.get("search"))
 
 
@@ -798,7 +840,8 @@ async def _partial_transcript(ws: WebSocket, endpointer, generation: int,
         print(f"[local] partial transcript failed: {exc}")
 
 
-async def _stream_reply(ws: WebSocket, sentences, holder: dict) -> None:
+async def _stream_reply(ws: WebSocket, sentences, holder: dict,
+                        voice: Optional[str] = None) -> None:
     """Speak a reply while it is still being written.
 
     `sentences` is a lazy iterable of the reply's sentences (Gemini's stream)
@@ -823,7 +866,7 @@ async def _stream_reply(ws: WebSocket, sentences, holder: dict) -> None:
                 parts.append(sentence)
                 holder["text"] = " ".join(parts).strip()
                 emit("text", sentence)
-                for chunk in local_voice.tts.stream(sentence):
+                for chunk in local_voice.tts.stream(sentence, voice=voice):
                     emit("audio", chunk)
         except Exception as exc:
             print(f"[local] reply stream failed: {exc}")
@@ -834,7 +877,7 @@ async def _stream_reply(ws: WebSocket, sentences, holder: dict) -> None:
             # past the fallback entirely, leaving the reply silent.
             if not parts:
                 try:
-                    emit("audio", local_voice.tts.speak(holder.get("fallback", "")))
+                    emit("audio", local_voice.tts.speak(holder.get("fallback", ""), voice=voice))
                 except Exception as exc2:
                     print(f"[local] tts failed entirely: {exc2}")
             loop.call_soon_threadsafe(queue.put_nowait, done)
@@ -865,7 +908,10 @@ async def voice_socket(ws: WebSocket):
     await ws.accept()
     sid = ws.query_params.get("session_id")
     llm = ws.query_params.get("llm")
-    await ws.send_json({"type": "session.ready", "session_id": sid, "llm": llm})
+    # Allowlisted: an unknown voice is the default, never a URL to fetch.
+    voice = tts_voice(ws.query_params.get("voice"))
+    await ws.send_json({"type": "session.ready", "session_id": sid, "llm": llm,
+                        "voice": voice})
     # Silero takes ~0.3 s to load; pay it off the event loop.
     endpointer = Endpointer(WIRE_RATE, vad=await run_in_threadpool(new_speech_detector))
     partials = os.getenv("HARK_STT_PARTIALS", "1") != "0"
@@ -934,6 +980,10 @@ async def voice_socket(ws: WebSocket):
                 continue
 
             name, args = await run_in_threadpool(local_voice.router.route, text)
+            # The router picks web_search but may leave the query out; the
+            # question itself is the best query then.
+            if name == "web_search" and not str((args or {}).get("query", "")).strip():
+                args = {**(args or {}), "query": text}
             result = await run_in_threadpool(run_local_tool, sid, name, args)
             # Show what the agent decided to do, before the answer. In the cloud
             # path the same thing rides the heartbeat, because AssemblyAI calls
@@ -944,7 +994,7 @@ async def voice_socket(ws: WebSocket):
             # while the rest is still being generated.
             holder = {"text": "", "fallback": _fallback_answer(result)}
             sentences = local_answer_stream(text, result.get("message", ""), llm)
-            await _stream_reply(ws, sentences, holder)
+            await _stream_reply(ws, sentences, holder, voice)
             if not holder["text"]:
                 # Gemini produced nothing, so the worker spoke the passage; the
                 # page still needs the words to show.
@@ -1264,6 +1314,8 @@ def health():
             "access_code": bool(ACCESS_CODE),
             "voice_provider": VOICE_PROVIDER,
             "local_models": local_voice.status(),
+            "tts_voices": [{"id": k, "label": v} for k, v in TTS_VOICES.items()],
+            "tts_voice_default": DEFAULT_TTS_VOICE,
             "vad": "silero" if vad_enabled() else "energy",
             "local_llms": local_llm.available_llms()}
 

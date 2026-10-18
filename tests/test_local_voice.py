@@ -246,7 +246,7 @@ def test_the_local_websocket_speaks_the_assemblyai_wire_protocol(monkeypatch):
     monkeypatch.setattr(main, "local_answer_stream",
                         lambda q, m, llm=None: iter(["It means the argument holds."]))
     monkeypatch.setattr(main.local_voice.tts, "stream",
-                        lambda text: iter([b"\x00\x01" * 4800]))
+                        lambda text, voice=None: iter([b"\x00\x01" * 4800]))
 
     def frame(value):
         return base64.b64encode(np.full(FRAME, value, np.int16).tobytes()).decode()
@@ -332,7 +332,7 @@ def test_an_empty_answer_still_speaks_the_passage(monkeypatch):
 
     spoken = {}
 
-    def fake_speak(text):
+    def fake_speak(text, voice=None):
         spoken["text"] = text
         return b"\x00\x01" * 100
 
@@ -355,3 +355,48 @@ def test_an_empty_answer_still_speaks_the_passage(monkeypatch):
     ], seen
     assert spoken["text"].startswith("From the book:")
 
+
+
+def test_a_voice_is_allowlisted_never_fetched():
+    # PocketTTS takes URLs as voices too; a query parameter must not reach it.
+    from hark.server.local_voice import DEFAULT_TTS_VOICE, TTS_VOICES, tts_voice
+    assert tts_voice("George") == "george" and "george" in TTS_VOICES
+    for bad in ("https://evil.example/x.wav", "hf://someone/voice.wav", "", None, "../alba"):
+        assert tts_voice(bad) == DEFAULT_TTS_VOICE
+
+
+def test_health_lists_the_voices():
+    h = TestClient(main.app).get("/api/health").json()
+    ids = [v["id"] for v in h["tts_voices"]]
+    assert h["tts_voice_default"] in ids and "george" in ids
+
+
+def test_the_chosen_voice_reaches_the_speaker(monkeypatch):
+    import base64
+
+    monkeypatch.setenv("HARK_STT_PARTIALS", "0")
+    monkeypatch.setenv("HARK_STT_VAD", "0")
+    monkeypatch.setattr(main.local_voice.stt, "transcribe", lambda audio: "what did that mean?")
+    monkeypatch.setattr(main.local_voice.router, "route", lambda text: ("passage_at_playhead", {}))
+    monkeypatch.setattr(main, "run_local_tool", lambda sid, name, args: {"ok": True, "message": "p"})
+    monkeypatch.setattr(main, "local_answer_stream", lambda q, m, llm=None: iter(["An answer."]))
+    voices = []
+
+    def fake_stream(text, voice=None):
+        voices.append(voice)
+        return iter([b"\x00\x01" * 100])
+
+    monkeypatch.setattr(main.local_voice.tts, "stream", fake_stream)
+
+    def frame(value):
+        return base64.b64encode(np.full(FRAME, value, np.int16).tobytes()).decode()
+
+    with TestClient(main.app).websocket_connect("/ws/voice?session_id=sV&voice=george") as ws:
+        assert ws.receive_json()["voice"] == "george"
+        for value, count in ((0, 20), (1600, 5), (0, 20)):
+            for _ in range(count):
+                ws.send_json({"type": "input.audio", "audio": frame(value)})
+        for _ in range(8):
+            if ws.receive_json()["type"] == "reply.done":
+                break
+    assert voices == ["george"]
