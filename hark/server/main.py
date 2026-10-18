@@ -53,8 +53,8 @@ from hark.core.library import Library
 
 from . import books, local_llm
 from .local_voice import (CONTENTLESS, HALLUCINATIONS, MIN_UTTERANCE_S, STT_RATE,
-                          WIRE_RATE, Endpointer, LocalVoice, pcm16_to_float,
-                          resample)
+                          WIRE_RATE, Endpointer, LocalVoice, new_speech_detector,
+                          pcm16_to_float, resample, vad_enabled)
 from .store import build_store
 
 load_dotenv()
@@ -740,6 +740,9 @@ def _audio_frames(pcm16: bytes, chunk_ms: int = 200):
 # nonsense like "Everybody loves him!").
 PARTIAL_INTERVAL_S = 1.0
 PARTIAL_MIN_S = 1.1
+# Less voiced audio than this in a turn is not a question (only checked when
+# Silero is gating; loudness alone cannot tell).
+MIN_VOICED_S = 0.3
 
 
 async def _partial_transcript(ws: WebSocket, endpointer, generation: int,
@@ -822,7 +825,8 @@ async def voice_socket(ws: WebSocket):
     sid = ws.query_params.get("session_id")
     llm = ws.query_params.get("llm")
     await ws.send_json({"type": "session.ready", "session_id": sid, "llm": llm})
-    endpointer = Endpointer(WIRE_RATE)
+    # Silero takes ~0.3 s to load; pay it off the event loop.
+    endpointer = Endpointer(WIRE_RATE, vad=await run_in_threadpool(new_speech_detector))
     partials = os.getenv("HARK_STT_PARTIALS", "1") != "0"
     partial_task = None
     last_partial = 0.0
@@ -860,6 +864,11 @@ async def voice_socket(ws: WebSocket):
             # from the speakers. Transcribing it just invites a hallucination.
             if len(audio16) < MIN_UTTERANCE_S * STT_RATE:
                 print("[local] dropped: too short")
+                continue
+            # Long enough, but mostly not a voice: a fan, a door, the TV. Whistle
+            # would put words to it anyway.
+            if endpointer.gated and endpointer.last_voiced_s < MIN_VOICED_S:
+                print(f"[local] dropped: only {endpointer.last_voiced_s:.2f}s of speech")
                 continue
             text = (await run_in_threadpool(local_voice.stt.transcribe, audio16) or "").strip()
             print(f"[local] heard: {text!r}")
@@ -1199,6 +1208,7 @@ def health():
             "access_code": bool(ACCESS_CODE),
             "voice_provider": VOICE_PROVIDER,
             "local_models": local_voice.status(),
+            "vad": "silero" if vad_enabled() else "energy",
             "local_llms": local_llm.available_llms()}
 
 

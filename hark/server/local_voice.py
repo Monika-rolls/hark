@@ -100,6 +100,12 @@ class Endpointer:
     Timing is in seconds, not frames, so the thresholds do not move if the
     browser's frame size changes, and both are settings: a shorter silence makes
     the answer come sooner, at the risk of cutting a thinking pause in half.
+
+    Loud is not the same as speech: a fan, a TV or a door is loud too, and
+    Whistle answers anything it is given with words. With a `vad` (a
+    SpeechDetector), a frame only counts as hot when it is loud *and* voiced, and
+    a voiceless stretch counts as quiet, so noise neither opens a turn nor holds
+    one open. `last_voiced_s` says how much of the last turn was a voice.
     """
 
     def __init__(
@@ -110,6 +116,7 @@ class Endpointer:
         attack_s: Optional[float] = None,
         silence_s: Optional[float] = None,
         max_seconds: float = MAX_UTTERANCE_S,
+        vad: Optional["SpeechDetector"] = None,
     ):
         # 450 ms of silence ends the turn (was ~1 s, which added a wait to every
         # question). 150 ms of speech opens it. Both are settings.
@@ -130,6 +137,14 @@ class Endpointer:
         self._frames: List[np.ndarray] = []
         self._tail: List[np.ndarray] = []
         self._gen = 0
+        self._vad = vad
+        self._voiced_run = 0
+        self.last_voiced_s = 0.0
+
+    @property
+    def gated(self) -> bool:
+        """True when a speech detector, not loudness alone, decides."""
+        return self._vad is not None
 
     def _threshold(self) -> float:
         return max(self._floor * self._ratio, self._min_trigger)
@@ -155,6 +170,10 @@ class Endpointer:
         n = len(frame)
         rms = float(np.sqrt(np.mean(frame * frame))) if n else 0.0
         threshold = self._threshold()
+        # Every frame goes to the detector, hot or not: it carries state from
+        # one chunk to the next and scores worse on a stream with holes in it.
+        voiced = self._vad.is_speech(frame, self._speaking) if self._vad else True
+        hot = rms > threshold and voiced
 
         if not self._speaking:
             # Adapt the noise floor only while nobody is speaking, and only
@@ -162,27 +181,96 @@ class Endpointer:
             self._floor = 0.95 * self._floor + 0.05 * rms
             self._tail.append(frame)
             self._tail = self._tail[-4:]          # ~0.34 s of run-up
-            self._active_run = self._active_run + n if rms > threshold else 0
+            self._active_run = self._active_run + n if hot else 0
             if self._active_run >= self._attack_samples:
                 self._speaking = True
                 self._gen += 1
                 self._quiet_run = 0
+                self._voiced_run = self._active_run
                 self._frames = list(self._tail)
                 return ("start", None)
             return None
 
         self._frames.append(frame)
-        self._quiet_run = self._quiet_run + n if rms <= threshold else 0
+        self._quiet_run = self._quiet_run + n if not hot else 0
+        if hot:
+            self._voiced_run += n
         total = sum(len(f) for f in self._frames)
         if self._quiet_run >= self._hangover_samples or total >= self._max_samples:
             audio = np.concatenate(self._frames) if self._frames else np.zeros(0, np.float32)
+            self.last_voiced_s = self._voiced_run / self.rate
             self._speaking = False
             self._gen += 1
             self._active_run = 0
             self._quiet_run = 0
+            self._voiced_run = 0
             self._frames = []
             self._tail = []
             return ("end", audio)
+        return None
+
+
+class SpeechDetector:
+    """Silero VAD: is this frame a voice, or only loud?
+
+    Silero scores 32 ms chunks of 16 kHz audio for speech. Frames arrive at the
+    wire rate in whatever size the browser sends, so they are resampled and
+    buffered into whole chunks. Two thresholds, as Silero recommends: a chunk has
+    to clear 0.5 to open a turn but only 0.35 to keep one open, so a soft word in
+    the middle of a question does not end it.
+
+    One per session -- the model keeps state across chunks, so two listeners
+    cannot share one.
+    """
+
+    CHUNK = 512  # 32 ms at 16 kHz, the window Silero is trained on
+
+    def __init__(self, on: float = 0.5, off: float = 0.35):
+        from silero_vad import load_silero_vad
+        self._model = load_silero_vad()
+        self._on = on
+        self._off = off
+        self._buf = np.zeros(0, np.float32)
+        self._voiced = False
+
+    def is_speech(self, frame: np.ndarray, speaking: bool = False) -> bool:
+        import torch
+        self._buf = np.concatenate([self._buf, resample(frame, WIRE_RATE, STT_RATE)])
+        best = None
+        with torch.no_grad():
+            while len(self._buf) >= self.CHUNK:
+                chunk, self._buf = self._buf[:self.CHUNK], self._buf[self.CHUNK:]
+                p = float(self._model(torch.from_numpy(chunk.copy()), STT_RATE).item())
+                best = p if best is None else max(best, p)
+        # A frame shorter than a chunk keeps the last verdict.
+        if best is not None:
+            self._voiced = best >= (self._off if speaking else self._on)
+        return self._voiced
+
+
+def vad_enabled() -> bool:
+    """Silero gating is on unless HARK_STT_VAD=0, and the package is installed."""
+    if os.getenv("HARK_STT_VAD", "1") == "0":
+        return False
+    try:
+        import silero_vad  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def new_speech_detector() -> Optional[SpeechDetector]:
+    """A detector for one session, or None to gate on loudness alone.
+
+    A missing or broken silero-vad degrades to the energy gate with a note,
+    rather than taking local mode down.
+    """
+    if not vad_enabled():
+        return None
+    try:
+        return SpeechDetector()
+    except Exception as exc:
+        print(f"[local] silero vad failed to load, gating on loudness alone: {exc}")
         return None
 
 

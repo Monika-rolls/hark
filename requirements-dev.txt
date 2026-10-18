@@ -16,3 +16,6 @@ cactus-needle==3.1.0
 # wheel is already CPU-only. On Linux add --extra-index-url
 # https://download.pytorch.org/whl/cpu to avoid the ~3 GB CUDA wheels.
 pocket-tts==3.3.0
+# Silero VAD: a turn opens only on a voice, not on any noise. Uses the torch
+# PocketTTS already pulls; without it the endpointer gates on loudness alone.
+silero-vad==6.2.3

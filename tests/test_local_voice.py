@@ -82,6 +82,62 @@ def test_the_endpointer_exposes_the_turn_for_a_live_partial():
     assert not ep.speaking and ep.buffered() is None
 
 
+
+class _Verdict:
+    """A stand-in SpeechDetector that says what it is told."""
+
+    def __init__(self, voiced):
+        self.voiced = voiced
+
+    def is_speech(self, frame, speaking=False):
+        return self.voiced
+
+
+def test_loud_noise_that_is_not_a_voice_opens_no_turn():
+    # A fan or a door clears the energy gate; the detector says no voice.
+    events = _feed(Endpointer(RATE, vad=_Verdict(False)), _quiet(20) + _speech(30) + _quiet(20))
+    assert events == []
+
+
+def test_a_voice_opens_and_noise_closes_the_turn():
+    vad = _Verdict(True)
+    ep = Endpointer(RATE, vad=vad)
+    events = _feed(ep, _quiet(20) + _speech(5))
+    assert events == ["start"]
+    # Still loud, but no longer a voice: that is the end of the question, not
+    # a 28-second turn held open by the fan.
+    vad.voiced = False
+    assert _feed(ep, _speech(10)) == ["end"]
+    assert ep.gated
+    assert ep.last_voiced_s == pytest.approx(5 * FRAME / RATE)
+
+
+def _silero():
+    pytest.importorskip("silero_vad")
+    from hark.server.local_voice import SpeechDetector
+    return SpeechDetector()
+
+
+def test_silero_hears_no_voice_in_loud_noise():
+    rng = np.random.default_rng(0)
+    noise = [(rng.standard_normal(FRAME) * 0.1).astype(np.float32) for _ in range(40)]
+    ep = Endpointer(RATE, vad=_silero())
+    assert _feed(ep, _quiet(20) + noise + _quiet(20)) == []
+
+
+def test_silero_hears_the_narrator():
+    sf = pytest.importorskip("soundfile")
+    from pathlib import Path
+    path = Path(__file__).resolve().parent.parent / "public" / "audio" / "calculus.mp3"
+    try:
+        audio, rate = sf.read(str(path), frames=12 * 44100, dtype="float32", always_2d=True)
+    except Exception as exc:
+        pytest.skip(f"cannot decode the demo book here: {exc}")
+    voice = resample(audio.mean(axis=1), rate, RATE)[RATE * 2:RATE * 10]
+    frames = [voice[i:i + FRAME] for i in range(0, len(voice) - FRAME, FRAME)]
+    ep = Endpointer(RATE, vad=_silero())
+    assert "start" in _feed(ep, _quiet(20) + frames + _quiet(20))
+
 def test_resample_moves_24k_to_16k():
     x = np.ones(RATE, np.float32)
     y = resample(x, RATE, 16000)
@@ -179,6 +235,8 @@ def test_the_local_websocket_speaks_the_assemblyai_wire_protocol(monkeypatch):
 
     # Partials would race the single-turn assertion below; covered separately.
     monkeypatch.setenv("HARK_STT_PARTIALS", "0")
+    # A flat tone is loud but not a voice; this covers the protocol, not the VAD.
+    monkeypatch.setenv("HARK_STT_VAD", "0")
     monkeypatch.setattr(main.local_voice.stt, "transcribe",
                         lambda audio: "what did that last sentence mean?")
     monkeypatch.setattr(main.local_voice.router, "route",
@@ -256,6 +314,8 @@ def test_an_empty_answer_still_speaks_the_passage(monkeypatch):
     import base64
 
     monkeypatch.setenv("HARK_STT_PARTIALS", "0")
+    # A flat tone is loud but not a voice; this covers the protocol, not the VAD.
+    monkeypatch.setenv("HARK_STT_VAD", "0")
     monkeypatch.setattr(main.local_voice.stt, "transcribe", lambda audio: "what did that mean?")
     monkeypatch.setattr(main.local_voice.router, "route",
                         lambda text: ("passage_at_playhead", {}))

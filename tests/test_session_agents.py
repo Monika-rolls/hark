@@ -101,6 +101,8 @@ def test_a_long_passage_is_trimmed_to_fit_the_tool_response_cap():
 
 def test_access_code_guards_only_what_spends_credit(created, monkeypatch):
     monkeypatch.setattr(main, "ACCESS_CODE", "LISTEN-TEST")
+    # A cloud session is what spends credit; a local .env may default to local.
+    monkeypatch.setattr(main, "VOICE_PROVIDER", "assemblyai")
     client = TestClient(main.app)
     # Spending credit: refused without the code, or with the wrong one.
     assert client.get("/api/session").status_code == 401
