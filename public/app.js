@@ -131,9 +131,9 @@ function clockText(t) {
 // The opening steps, kept here so clearing the conversation can put them back
 // rather than leaving an empty panel.
 const STEPS = [
-  'Pick a book from the <b>library</b>',
-  '<b>Enable asking questions</b>',
-  'Talk over it whenever something doesn&rsquo;t land',
+  'Pick something from the <b>Library</b> and press play',
+  'Tap <b>Enable asking questions</b>',
+  'Whenever something doesn&rsquo;t land, just talk: <b>&ldquo;Wait, what did that mean?&rdquo;</b>',
 ];
 
 let ledeCleared = false;
@@ -230,10 +230,64 @@ function toolLabel(t) {
   return (t && t.name ? t.name : "tool") + "(" + bits.join(", ") + ")";
 }
 
+// What each tool means to a listener. The raw call stays behind "Show
+// details"; this is the line everyone sees above the answer.
+const TOOL_CHIPS = {
+  passage_at_playhead: () => "📖 Reading what you just heard",
+  go_to_topic: () => "⏩ Finding that part",
+  book_outline: () => "🗺️ Skimming the whole book",
+  web_search: (a) => "🔎 Searching Google" + (a.query ? ": " + a.query : ""),
+  recap: () => "⏪ Recapping",
+  explain_simply: () => "💡 Explaining simply",
+  translate: (a) => "🌐 Translating" + (a.language ? " to " + a.language : ""),
+  quiz_me: () => "❓ Quiz time",
+  save_concept: () => "⭐ Saved to your notes",
+};
+
+function toolChip(t) {
+  const args = (t && t.arguments) || {};
+  const make = TOOL_CHIPS[t.name];
+  return make ? make(args) : "🛠️ " + t.name;
+}
+
 function showToolCall(t) {
   if (!t || !t.name) return;
   turn("tool", "calling " + toolLabel(t), "tool");
+  turn("hark", toolChip(t), "chip");
   debug("tool: " + toolLabel(t));
+  // The local socket follows a save with its own note.saved event, which
+  // carries the exact position and text; the cloud agent has no way to, so
+  // the note is made here from the call itself.
+  if (t.name === "save_concept" && activeProvider !== "local") {
+    const args = t.arguments || {};
+    saveConcept(args.concept || "", lastAnswer, pos());
+  }
+}
+
+// "Remember this": a note at the current moment, in the same list as the
+// questions, so it shows on the progress bar and in the export.
+let lastAnswer = "";
+
+function saveConcept(concept, text, at) {
+  const what = (concept || "").trim();
+  const body = (text || "").trim() || what;
+  if (!what && !body) return;
+  notes.push({ t: Math.round(isFinite(at) ? at : pos()), q: "⭐ " + (what || "Saved"),
+               a: body, at: new Date().toISOString() });
+  notes = notes.slice(-200);
+  storageSet(notesKey(), notes);
+  renderNotes();
+  toast("Saved to notes");
+}
+
+let toastTimer = null;
+function toast(msg) {
+  const t = el("toast");
+  if (!t) return;
+  t.textContent = msg;
+  t.hidden = false;
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.hidden = true; }, 2600);
 }
 
 // ---------- one timeline across many files ----------
@@ -382,10 +436,10 @@ function applySeek(seconds) {
 // each question was asked. Doubles as the scrubber, so position is read and
 // set in the same place.
 
-// On a phone the rail sits above the conversation rather than beside it, so the
-// axis lies flat and the questions become a list under it. Same information,
-// turned ninety degrees.
-const narrow = () => window.matchMedia("(max-width: 820px)").matches;
+// The axis is a flat progress bar at every width, and the questions are a list
+// under "Your questions" -- the shape every audio app has taught people to read.
+// Kept as a function so the paint and seek code reads the same either way.
+const narrow = () => true;
 
 function paintSpine() {
   const dur = duration();
@@ -427,6 +481,17 @@ function renderMarks() {
   const flow = narrow() || !dur;
   holder.classList.toggle("flow", flow);
   holder.textContent = "";
+  // A dot on the progress bar for every question, so the bar itself shows
+  // where the listening got hard.
+  const dots = el("spinedots");
+  if (dots) {
+    dots.textContent = "";
+    if (dur) notes.forEach((n) => {
+      const d = document.createElement("i");
+      d.style.left = Math.min(100, Math.max(0, (n.t / dur) * 100)).toFixed(2) + "%";
+      dots.appendChild(d);
+    });
+  }
   notes.forEach((n) => {
     const b = document.createElement("button");
     b.className = "mark";
@@ -615,13 +680,17 @@ let localModels = null;
 // Only meaningful when the voice engine is local.
 let answerModel = storageGet("hark:answerModel", null);
 let localLlms = null;
+// Which voice reads the answers in local mode. The server lists what it has in
+// /api/health; an id it does not know falls back to its default.
+let ttsVoice = storageGet("hark:voice", null);
 // Which engine the *running* session actually uses. The toggle only decides the
 // next session -- changing it while listening does not switch the voice you are
 // already hearing -- so the status line reports this, not the toggle.
 let activeProvider = "assemblyai";
 
 function liveStatus() {
-  setStatus(activeProvider === "local" ? "listening - local models" : "listening - cloud", "live");
+  if (live) setAsk("listening");
+  setStatus(activeProvider === "local" ? "listening — private mode" : "listening — just talk", "live");
 }
 
 function applyVoiceProvider(name) {
@@ -637,6 +706,9 @@ function applyVoiceProvider(name) {
   // The answer-model choice only means something in local mode.
   const llmGroup = el("llmengine");
   if (llmGroup) llmGroup.hidden = voiceProvider !== "local";
+  // So does the voice: the cloud agent speaks with its own.
+  const voiceSel = el("voice");
+  if (voiceSel) voiceSel.disabled = voiceProvider !== "local";
   applyAnswerModel(answerModel || "gemini");
   // Say when a model a local session needs is missing, rather than letting the
   // first question fail with something cryptic.
@@ -684,8 +756,29 @@ function buildVoiceProvider() {
   fetch("/api/health").then((r) => r.json()).then((h) => {
     localModels = h.local_models || null;
     localLlms = h.local_llms || null;
+    buildVoices(h.tts_voices, h.tts_voice_default);
     applyVoiceProvider(voiceProvider || h.voice_provider || "assemblyai");
   }).catch(() => applyVoiceProvider(voiceProvider || "assemblyai"));
+}
+
+function buildVoices(voices, fallback) {
+  const wrap = el("voicewrap");
+  const sel = el("voice");
+  if (!wrap || !sel) return;
+  if (!Array.isArray(voices) || !voices.length) { wrap.hidden = true; return; }
+  sel.textContent = "";
+  voices.forEach((v) => {
+    const o = document.createElement("option");
+    o.value = v.id;
+    o.textContent = v.label || v.id;
+    sel.appendChild(o);
+  });
+  const ids = voices.map((v) => v.id);
+  const pick = ids.includes(ttsVoice) ? ttsVoice : (ids.includes(fallback) ? fallback : ids[0]);
+  sel.value = pick;
+  ttsVoice = pick;
+  sel.disabled = voiceProvider !== "local";
+  wrap.hidden = false;
 }
 
 function warmLocal() {
@@ -834,8 +927,8 @@ function renderNotes() {
   el("clearnotes").disabled = notes.length === 0;
   el("notecount").textContent = notes.length ? String(notes.length) : "";
   el("railnote").textContent = notes.length
-    ? `${notes.length} question${notes.length > 1 ? "s" : ""} on this book. Click a mark to play from there.`
-    : "Questions you ask get pinned to the spine where you asked them. Import a file to bring notes from another machine.";
+    ? `${notes.length} question${notes.length > 1 ? "s" : ""} here so far. Tap one to replay from that moment.`
+    : "Every question you ask is saved here, at the moment you asked it, and marked on the progress bar.";
   renderMarks();
 }
 
@@ -997,8 +1090,8 @@ function askForCode(then, wrong) {
   afterCode = then;
   el("codebox").hidden = false;
   el("codemsg").textContent = wrong
-    ? "That code didn't work. Check the Hark submission on lablab.ai and try again."
-    : "Asking questions and adding books need the judges' access code. It's in the Hark submission on lablab.ai. Listening is open to everyone.";
+    ? "That code didn't work. Check it and try again."
+    : "Asking questions and adding books need an access code. Listening is open to everyone.";
   el("codein").focus();
 }
 function submitCode() {
@@ -1041,24 +1134,88 @@ async function loadShelf() {
        .forEach((b) => pollBook(b.id));
 }
 
+// Books and podcasts look alike on the wire; the optional `kind`, `author`,
+// `topic` and `blurb` fields say which is which. Anything without them is
+// shown plainly rather than guessed at.
+const kindOf = (b) => (b && (b.kind === "podcast" || b.kind === "book")) ? b.kind : "";
+const KIND_LABEL = { podcast: "Podcast", book: "Audiobook", "": "Audio" };
+
+function artFor(kind) {
+  const span = document.createElement("span");
+  span.className = "art" + (kind ? " " + kind : "");
+  span.setAttribute("aria-hidden", "true");
+  span.innerHTML = '<svg><use href="#' + (kind === "podcast" ? "i-pod" : "i-book") + '"/></svg>';
+  return span;
+}
+
+let kindFilter = "all";
+
+function applyKindFilter() {
+  const chips = el("kindfilter");
+  // Only worth offering when there is more than one kind on the shelf.
+  const kinds = new Set(shelf.map(kindOf).filter(Boolean));
+  if (chips) {
+    chips.hidden = kinds.size < 2;
+    if (chips.hidden) kindFilter = "all";
+    chips.querySelectorAll("button").forEach((c) =>
+      c.setAttribute("aria-pressed", String(c.dataset.kind === kindFilter)));
+  }
+  el("shelf").querySelectorAll("li[data-kind]").forEach((li) => {
+    li.dataset.hide = kindFilter !== "all" && li.dataset.kind !== kindFilter ? "1" : "0";
+  });
+}
+
 function renderShelf() {
   const list = el("shelf");
   list.textContent = "";
   shelf.forEach((b) => {
     const li = document.createElement("li");
+    const kind = kindOf(b);
+    li.dataset.kind = kind || "other";
     const btn = document.createElement("button");
     btn.type = "button";
-    if (currentBook && b.id === currentBook.id) btn.setAttribute("aria-current", "true");
+    btn.className = "pick";
+    const isCurrent = currentBook && b.id === currentBook.id;
+    if (isCurrent) btn.setAttribute("aria-current", "true");
 
+    const k = document.createElement("span");
+    k.className = "kind";
+    k.textContent = KIND_LABEL[kind];
+    if (isCurrent) {
+      const now = document.createElement("span");
+      now.className = "playing";
+      now.textContent = "· Now playing";
+      k.appendChild(now);
+    }
     const t = document.createElement("span");
     t.className = "t";
     t.textContent = b.title;
+    const by = document.createElement("span");
+    by.className = "by";
+    by.textContent = b.author || (b.builtin ? "Included" : "Added by you");
+    btn.append(artFor(kind), k, t, by);
+
+    if (b.blurb) {
+      const blurb = document.createElement("span");
+      blurb.className = "blurb";
+      blurb.textContent = b.blurb;
+      btn.appendChild(blurb);
+    }
+
     const m = document.createElement("span");
     m.className = "m";
-    m.textContent = b.status === "ready"
-      ? `${clockText(b.duration)} · ${b.chunks}`
-      : (b.status === "failed" ? "failed" : b.progress + "%");
-    btn.append(t, m);
+    const len = document.createElement("span");
+    len.textContent = b.status === "ready"
+      ? clockText(b.duration)
+      : (b.status === "failed" ? "failed" : "indexing " + b.progress + "%");
+    m.appendChild(len);
+    if (b.topic) {
+      const tag = document.createElement("span");
+      tag.className = "tag";
+      tag.textContent = b.topic;
+      m.appendChild(tag);
+    }
+    btn.appendChild(m);
 
     if (b.status !== "ready" && b.status !== "failed") {
       const bar = document.createElement("span");
@@ -1122,6 +1279,28 @@ function renderShelf() {
     }
     list.appendChild(li);
   });
+  // Adding your own is the last card in the row: findable, never in the way.
+  const li = document.createElement("li");
+  const add = document.createElement("button");
+  add.type = "button";
+  add.className = "addcard";
+  add.id = "addtoggle";
+  add.setAttribute("aria-controls", "addform");
+  add.setAttribute("aria-expanded", String(!el("addform").hidden));
+  add.innerHTML = '<b aria-hidden="true">+</b>Add your own<small>a book or podcast, by link or file</small>';
+  add.addEventListener("click", () => toggleAddForm());
+  li.appendChild(add);
+  list.appendChild(li);
+  applyKindFilter();
+}
+
+function toggleAddForm(open) {
+  const form = el("addform");
+  const show = open === undefined ? form.hidden : open;
+  form.hidden = !show;
+  const t = el("addtoggle");
+  if (t) t.setAttribute("aria-expanded", String(show));
+  if (show) el("addurl").focus({ preventScroll: true });
 }
 
 function selectBook(b, quiet) {
@@ -1135,6 +1314,7 @@ function selectBook(b, quiet) {
   currentBook = b;
   storageSet("hark:book", b.id);
   el("booktitle").textContent = b.title;
+  paintNowPlaying(b);
 
   // A book of many files becomes one timeline; a single file is just itself.
   //
@@ -1171,12 +1351,23 @@ function selectBook(b, quiet) {
     addStatus("“" + b.title + "” was added from a file on this device. Choose it again below to play it — the index is already built.", false);
     el("librarybtn").setAttribute("aria-expanded", "true");
     el("library").hidden = false;
+    toggleAddForm(true);
   } else if (!quiet) {
     addStatus("");
   }
   // Tell the backend straight away, so a question asked before the first
   // heartbeat still reaches the right book.
   if (session) reportPlayhead();
+}
+
+function paintNowPlaying(b) {
+  const kind = kindOf(b);
+  el("bookkind").textContent = "Now playing · " + KIND_LABEL[kind];
+  const bits = [b.author, b.topic].filter(Boolean);
+  el("bookmeta").textContent = bits.join(" · ");
+  const art = el("bookart");
+  art.className = "art" + (kind ? " " + kind : "");
+  art.innerHTML = '<svg><use href="#' + (kind === "podcast" ? "i-pod" : "i-book") + '"/></svg>';
 }
 
 function renderLimits() {
@@ -1297,7 +1488,7 @@ async function addByUrl(presetUrl, presetTitle) {
     });
     if (res.status === 401) {
       el("addbtn").disabled = false;
-      addStatus("Adding a book needs the judges' access code (above, under the microphone button).", true);
+      addStatus("Adding a book needs the access code (under the microphone button).", true);
       askForCode(() => addByUrl(presetUrl, presetTitle), !!storageGet("hark:code", ""));
       return;
     }
@@ -1357,7 +1548,7 @@ async function addByFile(file) {
       body: file,
     });
     if (res.status === 401) {
-      addStatus("Adding a book needs the judges' access code (above, under the microphone button).", true);
+      addStatus("Adding a book needs the access code (under the microphone button).", true);
       askForCode(() => addByFile(file), !!storageGet("hark:code", ""));
       return;
     }
@@ -1529,14 +1720,21 @@ function stopSession() {
   unduck();
   setListenIcon(false);
   startBtn.disabled = false;
-  setStatus("not listening — the book plays on", "idle");
+  setStatus("microphone off — the audio plays on", "idle");
   debug("session stopped, microphone released");
 }
 
 function setListenIcon(on) {
   live = on;
-  startBtn.textContent = on ? "Stop listening" : "Enable asking questions";
+  el("asklabel").textContent = on ? "Stop listening" : "Enable asking questions";
   startBtn.classList.toggle("live", on);
+  setAsk(on ? "listening" : "off");
+}
+
+// What the ask control shows: off, connecting, listening, hearing (you are
+// talking), thinking, answering. The page styles itself from this one value.
+function setAsk(state) {
+  document.body.dataset.ask = state;
 }
 
 // ---------- hanging up on an idle session ----------
@@ -1572,6 +1770,7 @@ async function start() {
   }
   unlockAudio();
   startBtn.disabled = true;
+  setAsk("connecting");
   setStatus("connecting", "busy");
   try {
     const res = await fetch("/api/session?provider=" + encodeURIComponent(voiceProvider || "")
@@ -1580,7 +1779,8 @@ async function start() {
     if (res.status === 401) {
       const hadCode = !!storageGet("hark:code", "");
       startBtn.disabled = false;
-      setStatus("needs the judges' access code", "idle");
+      setAsk("off");
+      setStatus("needs the access code", "idle");
       askForCode(start, hadCode);
       return;
     }
@@ -1588,6 +1788,7 @@ async function start() {
     if (session.detail) throw new Error(session.detail);
   } catch (e) {
     setStatus("backend error: " + e.message, "error");
+    setAsk("off");
     startBtn.disabled = false;
     return;
   }
@@ -1602,10 +1803,11 @@ async function start() {
     warmLocal();
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const path = session.ws_path || "/ws/voice";
-    ws = new WebSocket(`${proto}//${location.host}${path}?session_id=${encodeURIComponent(session.session_id)}&llm=${encodeURIComponent(answerModel || "gemini")}`);
+    const voiceParam = ttsVoice ? `&voice=${encodeURIComponent(ttsVoice)}` : "";
+    ws = new WebSocket(`${proto}//${location.host}${path}?session_id=${encodeURIComponent(session.session_id)}&llm=${encodeURIComponent(answerModel || "gemini")}${voiceParam}`);
     ws.onopen = () => {
       debug("local voice socket open");
-      setStatus("loading local models", "busy");
+      setStatus("loading the speech models", "busy");
     };
   } else {
     ws = new WebSocket(`${WS_URL}?token=${encodeURIComponent(session.token)}`);
@@ -1690,7 +1892,8 @@ async function start() {
         // speech-to-text takes seconds, and a book still audible under the
         // question reads as the book and the agent talking at once.
         pauseBook();
-        setStatus("you're talking", "live");
+        setAsk("hearing");
+        setStatus("hearing you…", "live");
         break;
 
       case "transcript.user.delta":
@@ -1712,6 +1915,7 @@ async function start() {
         }
         addUserSpeech(m.text || "");
         pauseBook();
+        setAsk("thinking");
         setStatus("thinking", "busy");
         break;
 
@@ -1719,12 +1923,19 @@ async function start() {
         // Already paused at speech start; this just holds it while the answer
         // is prepared, so the book cannot creep back before the agent speaks.
         pauseBook();
+        setAsk("thinking");
         setStatus("thinking", "busy");
         break;
 
       case "tool.call":
         // Which book tool the agent chose, and its arguments.
         showToolCall(m);
+        break;
+
+      case "note.saved":
+        // save_concept on the local engine: the server says exactly what to
+        // keep and where.
+        saveConcept(m.concept || "", m.text || lastAnswer, typeof m.at === "number" ? m.at : pos());
         break;
 
       case "reply.started":
@@ -1742,6 +1953,7 @@ async function start() {
         // ignored. Every answer re-asserts it.
         pauseBook();
         flushReply();
+        setAsk("answering");
         setStatus("answering", "busy");
         break;
 
@@ -1764,7 +1976,7 @@ async function start() {
         }
         agentSpeaking = false;
         // The whole reply is in now; file it as one note.
-        if (agentText) { noteAnswer(agentText); openAgent = null; agentText = ""; }
+        if (agentText) { lastAnswer = agentText; noteAnswer(agentText); openAgent = null; agentText = ""; }
         if (m.status === "interrupted") flushReply();
         // Back up slightly so the run-up to the question is re-heard -- unless
         // the agent just moved us somewhere on purpose, or the book never
@@ -1862,6 +2074,50 @@ el("librarybtn").addEventListener("click", () => {
 });
 
 el("addbtn").addEventListener("click", () => addByUrl());
+
+el("kindfilter").querySelectorAll("button").forEach((c) => c.addEventListener("click", () => {
+  kindFilter = c.dataset.kind;
+  applyKindFilter();
+}));
+
+el("back15").addEventListener("click", () => { seek(pos() - 15); justSeeked = true; paintSpine(); });
+el("fwd15").addEventListener("click", () => { seek(pos() + 15); justSeeked = true; paintSpine(); });
+
+// Settings: a sheet over the page, because none of it is needed to start.
+let settingsReturn = null;
+function openSettings() {
+  settingsReturn = document.activeElement;
+  el("settings").hidden = false;
+  el("settingsbtn").setAttribute("aria-expanded", "true");
+  el("settingsclose").focus();
+}
+function closeSettings() {
+  el("settings").hidden = true;
+  el("settingsbtn").setAttribute("aria-expanded", "false");
+  if (settingsReturn && settingsReturn.focus) settingsReturn.focus();
+}
+el("settingsbtn").addEventListener("click", openSettings);
+el("voice").addEventListener("change", (e) => {
+  ttsVoice = e.target.value;
+  storageSet("hark:voice", ttsVoice);
+});
+el("settingsclose").addEventListener("click", closeSettings);
+el("settingsscrim").addEventListener("click", closeSettings);
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !el("settings").hidden) closeSettings();
+});
+
+// The machinery -- which tool was called, the event log -- is there for
+// anyone who wants to see it, and out of the way for everyone else.
+el("detailsbtn").addEventListener("click", () => {
+  const on = !document.body.classList.contains("details");
+  document.body.classList.toggle("details", on);
+  el("detailsbtn").setAttribute("aria-pressed", String(on));
+  el("detailsbtn").textContent = on ? "Hide details" : "Show details";
+  el("logwrap").hidden = !on;
+  storageSet("hark:details", on);
+});
+if (storageGet("hark:details", false)) el("detailsbtn").click();
 el("addurl").addEventListener("keydown", (e) => { if (e.key === "Enter") addByUrl(); });
 
 // The spine changes axis with the layout, so it has to be repainted when the

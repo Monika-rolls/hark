@@ -69,6 +69,14 @@ def pick_book(page, title):
         "t => document.getElementById('booktitle').textContent === t", arg=title)
 
 
+def set_speed(page, value):
+    """Speed lives in the Settings sheet, which starts closed."""
+    page.click("#settingsbtn")
+    page.fill("#speed", value)
+    page.dispatch_event("#speed", "input")
+    page.click("#settingsclose")
+
+
 def start_session(page):
     """Press the start button and bring the fake agent up to `session.ready`."""
     page.click("#start")
@@ -87,8 +95,7 @@ def test_speed_survives_a_book_change(page):
     load() resets playbackRate to defaultPlaybackRate, which nothing set, so
     the audio dropped to 1x while the slider still read 3.00x.
     """
-    page.fill("#speed", "3")
-    page.dispatch_event("#speed", "input")
+    set_speed(page, "3")
     assert page.evaluate("document.getElementById('book').playbackRate") == 3
 
     pick_book(page, "Three Part Book")
@@ -101,8 +108,7 @@ def test_speed_survives_a_book_change(page):
 def test_speed_survives_a_part_handover(page):
     """A 54-hour book changes file many times; the rate must not reset."""
     pick_book(page, "Three Part Book")
-    page.fill("#speed", "2")
-    page.dispatch_event("#speed", "input")
+    set_speed(page, "2")
 
     # Jump into part three: a real handover, not just a currentTime change.
     page.evaluate(f"window.__seek = {PART_SECONDS[0] + PART_SECONDS[1] + 1}")
@@ -115,8 +121,7 @@ def test_speed_survives_a_part_handover(page):
 
 
 def test_speed_persists_across_a_reload(page):
-    page.fill("#speed", "1.5")
-    page.dispatch_event("#speed", "input")
+    set_speed(page, "1.5")
     page.reload()
     page.wait_for_function("document.getElementById('book').readyState >= 1")
     assert page.evaluate("document.getElementById('book').playbackRate") == 1.5
@@ -431,9 +436,10 @@ def test_play_button_reflects_actual_state(page):
 
 
 def test_the_spine_scrubs_to_where_you_click(page):
+    page.locator("#spine").scroll_into_view_if_needed()
     box = page.locator("#spine").bounding_box()
-    # Three-quarters of the way down the vertical axis.
-    page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] * 0.75)
+    # Three-quarters of the way along the progress bar.
+    page.mouse.move(box["x"] + box["width"] * 0.75, box["y"] + box["height"] / 2)
     page.mouse.down()
     page.mouse.up()
     page.wait_for_function("pos() > 10")
@@ -501,3 +507,64 @@ def test_the_idle_timer_does_not_outlive_the_session(page):
     page.click("#start")
     page.wait_for_function("live === false")
     assert page.evaluate("idleTimer === null")
+
+
+# --------------------------------------------------------------------------
+# settings
+# --------------------------------------------------------------------------
+
+def test_the_chosen_voice_reaches_the_local_socket(page):
+    """Voice is a local-engine setting: offered from /api/health, sent on the socket."""
+    page.click("#settingsbtn")
+    page.wait_for_selector("#voicewrap:not([hidden])")
+    assert page.is_disabled("#voice"), "the cloud agent has its own voice"
+    page.click("#voiceengine button[data-engine='local']")
+    assert page.is_enabled("#voice")
+    page.select_option("#voice", "marius")
+    page.click("#settingsclose")
+    page.click("#start")
+    page.wait_for_function("window.__ws !== undefined")
+    assert "voice=marius" in page.evaluate("window.__ws.url")
+    assert page.evaluate("JSON.parse(localStorage.getItem('hark:voice'))") == "marius"
+
+
+def test_details_are_hidden_until_asked_for(page):
+    """Tool calls are for the curious; the conversation is for everyone."""
+    page.evaluate("showToolCall({name: 'passage_at_playhead', arguments: {}})")
+    assert not page.is_visible("#transcript .turn.tool")
+    page.click("#detailsbtn")
+    assert page.is_visible("#transcript .turn.tool")
+    assert page.is_visible("#logwrap")
+
+
+def test_the_chosen_tool_is_shown_above_the_answer(page):
+    """Which tool Hark used is visible to everyone, in words, not code."""
+    page.evaluate("showToolCall({name: 'web_search', arguments: {query: 'dark energy'}})")
+    chip = page.locator("#transcript .turn.chip").last
+    assert chip.is_visible()
+    assert "Searching Google: dark energy" in chip.inner_text()
+    page.evaluate("showToolCall({name: 'mystery_tool', arguments: {}})")
+    assert "mystery_tool" in page.locator("#transcript .turn.chip").last.inner_text()
+
+
+def test_remember_this_saves_a_note_where_you_are(page):
+    page.evaluate("seek(9)")
+    page.wait_for_function("Math.abs(pos() - 9) < 1")
+    page.evaluate("showToolCall({name: 'save_concept', arguments: {concept: 'implicit functions'}})")
+    page.wait_for_function("notes.length === 1")
+    note = page.evaluate("notes[0]")
+    assert "implicit functions" in note["q"] and abs(note["t"] - 9) <= 1
+    assert page.is_visible("#toast")
+
+
+def test_the_local_engine_saves_from_its_own_event(page):
+    """note.saved carries the position; the tool call must not save twice."""
+    page.evaluate("activeProvider = 'local'")
+    start_session(page)
+    page.evaluate("activeProvider = 'local'")
+    page.evaluate("window.__agent({type:'tool.call', name:'save_concept', arguments:{concept:'x'}})")
+    assert page.evaluate("notes.length") == 0
+    page.evaluate("window.__agent({type:'note.saved', at: 5, concept: 'entropy', text: 'disorder'})")
+    page.wait_for_function("notes.length === 1")
+    assert page.evaluate("notes[0].t") == 5
+

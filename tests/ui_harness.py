@@ -142,7 +142,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 if b["id"] == wanted:
                     return self._send(b)
             return self._send({"detail": "no such book"})
+        if path == "/api/health":
+            return self._send({"ok": True, "voice_provider": "assemblyai",
+                               "tts_voices": [{"id": "alba", "label": "Alba"},
+                                              {"id": "marius", "label": "Marius"}],
+                               "tts_voice_default": "alba"})
         if path == "/api/session":
+            if "provider=local" in self.path:
+                return self._send({"provider": "local", "session_id": "s1",
+                                   "ws_path": "/ws/voice"})
             return self._send({"token": "t", "agent_id": "a", "session_id": "s1"})
         return self._send({"detail": "not found"})
 
