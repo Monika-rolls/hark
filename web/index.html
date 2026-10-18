@@ -5,7 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Hark</title>
 <meta name="description" content="Audiobooks and podcasts you can interrupt. Ask about what you just heard.">
-<meta name="theme-color" content="#4285F4">
+<meta name="theme-color" content="#0b0f14">
+<link rel="icon" href="/images/screen.png" type="image/png">
+<link rel="apple-touch-icon" href="/images/screen.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=Roboto:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap">
@@ -97,9 +99,14 @@
     border-bottom:1px solid var(--rule);
   }
   .wordmark{
-    margin:0; font-family:var(--display); font-size:28px; font-weight:700; letter-spacing:-.02em;
+    margin:0; display:flex; align-items:center; gap:10px;
+    font-family:var(--display); font-size:28px; font-weight:700; letter-spacing:-.02em;
+    line-height:1;
+  }
+  .wordmark img{width:36px; height:36px; border-radius:10px; display:block; flex:none}
+  .wordmark span{
     background:var(--grad); -webkit-background-clip:text; background-clip:text;
-    color:transparent; line-height:1;
+    color:transparent;
   }
   .tagline{margin:0; font-family:var(--display); font-size:14px; font-weight:500; color:var(--ink-2); flex:1; min-width:0;
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
@@ -492,7 +499,7 @@
 </svg>
 
 <header>
-  <h1 class="wordmark">Hark</h1>
+  <h1 class="wordmark"><img src="/images/screen.png" alt="" width="36" height="36"><span>Hark</span></h1>
   <p class="tagline">Listen. Interrupt. Understand.</p>
   <span class="spacer"></span>
   <button class="iconbtn" id="librarybtn" type="button" aria-expanded="true" aria-controls="library">
