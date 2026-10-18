@@ -1,0 +1,16 @@
+# Never ship keys or local-only weights in the image.
+.env
+.env.*
+!.env.example
+.git/
+.venv/
+**/__pycache__/
+.pytest_cache/
+/models/
+/checkpoints/
+/audio/
+/*.mp3
+*.log
+data/podcast-32k.*
+submission/
+video/

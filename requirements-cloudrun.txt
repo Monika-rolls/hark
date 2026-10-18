@@ -1,0 +1,7 @@
+# The Cloud Run image: the web app plus the local voice pipeline, with Gemini
+# writing the answers. CPU-only torch comes from the extra index in Dockerfile.
+-r requirements.txt
+uvicorn[standard]==0.37.0
+cactus-needle==3.1.0
+pocket-tts==3.3.0
+silero-vad==6.2.3
