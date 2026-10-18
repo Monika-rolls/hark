@@ -349,8 +349,11 @@ class RedisStore:
 
 
 def build_store() -> PlayheadStore:
-    url = os.getenv("UPSTASH_REDIS_REST_URL", "").strip()
-    token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
+    # Vercel's Upstash integration names them KV_REST_API_*; accept either.
+    url = (os.getenv("UPSTASH_REDIS_REST_URL", "")
+           or os.getenv("KV_REST_API_URL", "")).strip()
+    token = (os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+             or os.getenv("KV_REST_API_TOKEN", "")).strip()
     if url and token:
         return RedisStore(url, token)
     print("[store] no Upstash config - using process memory. "
