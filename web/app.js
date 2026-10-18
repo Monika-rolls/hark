@@ -261,7 +261,7 @@ function showToolCall(t) {
   // The local socket follows a save with its own note.saved event, which
   // carries the exact position and text; the cloud agent has no way to, so
   // the note is made here from the call itself.
-  if (t.name === "save_concept" && activeProvider !== "local") {
+  if (t.name === "save_concept" && !OWN_SOCKET.includes(activeProvider)) {
     const args = t.arguments || {};
     saveConcept(args.concept || "", lastAnswer, pos());
   }
@@ -718,6 +718,13 @@ let localLlms = null;
 // Which voice reads the answers in local mode. The server lists what it has in
 // /api/health; an id it does not know falls back to its default.
 let ttsVoice = storageGet("hark:voice", null);
+// The Google engine has its own voices (Chirp 3 HD), kept separately so
+// switching engines does not lose either choice.
+let googleVoice = storageGet("hark:googleVoice", null);
+let voiceLists = { local: [], localDefault: "", google: [], googleDefault: "" };
+let googleAvailable = null;
+// Engines that run over our own /ws/voice protocol rather than AssemblyAI's.
+const OWN_SOCKET = ["local", "google"];
 // Tools the listener switched off. Stored as the off list so a tool the
 // server adds later is on by default.
 let toolsOff = (() => {
@@ -731,11 +738,15 @@ let activeProvider = "assemblyai";
 
 function liveStatus() {
   if (live) setAsk("listening");
-  setStatus(activeProvider === "local" ? "listening — private mode" : "listening — just talk", "live");
+  setStatus(activeProvider === "local" ? "listening — private mode"
+            : activeProvider === "google" ? "listening — Google Cloud"
+            : "listening — just talk", "live");
 }
 
 function applyVoiceProvider(name) {
-  voiceProvider = name === "local" ? "local" : "assemblyai";
+  voiceProvider = name === "local" || name === "google" ? name : "assemblyai";
+  // An engine the server says it cannot run falls back to the cloud agent.
+  if (voiceProvider === "google" && googleAvailable === false) voiceProvider = "assemblyai";
   storageSet("hark:voiceprovider", voiceProvider);
   // Null-safe: a cached older page has no #voiceengine, and a throw here would
   // abort the rest of init -- loadShelf() included, which is what selects a
@@ -747,9 +758,8 @@ function applyVoiceProvider(name) {
   // The answer-model choice only means something in local mode.
   const llmGroup = el("llmengine");
   if (llmGroup) llmGroup.hidden = voiceProvider !== "local";
-  // So does the voice: the cloud agent speaks with its own.
-  const voiceSel = el("voice");
-  if (voiceSel) voiceSel.disabled = voiceProvider !== "local";
+  // The voice list follows the engine; the cloud agent speaks with its own.
+  renderVoiceSelect();
   applyAnswerModel(answerModel || "gemini");
   // Say when a model a local session needs is missing, rather than letting the
   // first question fail with something cryptic.
@@ -797,30 +807,58 @@ function buildVoiceProvider() {
   fetch("/api/health").then((r) => r.json()).then((h) => {
     localModels = h.local_models || null;
     localLlms = h.local_llms || null;
-    buildVoices(h.tts_voices, h.tts_voice_default);
+    googleAvailable = h.google_voice ? !!h.google_voice.available : null;
+    paintGoogleChoice();
+    buildVoices(h.tts_voices, h.tts_voice_default, h.google_tts_voices, h.google_tts_voice_default);
     buildTools(h.tools);
     applyVoiceProvider(voiceProvider || h.voice_provider || "assemblyai");
   }).catch(() => applyVoiceProvider(voiceProvider || "assemblyai"));
 }
 
-function buildVoices(voices, fallback) {
+function buildVoices(voices, fallback, gVoices, gFallback) {
+  voiceLists = {
+    local: Array.isArray(voices) ? voices : [], localDefault: fallback || "",
+    google: Array.isArray(gVoices) ? gVoices : [], googleDefault: gFallback || "",
+  };
+  const pickFrom = (list, saved, dflt) => {
+    const ids = list.map((v) => v.id);
+    return ids.includes(saved) ? saved : (ids.includes(dflt) ? dflt : (ids[0] || null));
+  };
+  ttsVoice = pickFrom(voiceLists.local, ttsVoice, voiceLists.localDefault);
+  googleVoice = pickFrom(voiceLists.google, googleVoice, voiceLists.googleDefault);
+  renderVoiceSelect();
+}
+
+// One picker, two lists: Local voices or Google's, whichever engine is chosen.
+function renderVoiceSelect() {
   const wrap = el("voicewrap");
   const sel = el("voice");
   if (!wrap || !sel) return;
-  if (!Array.isArray(voices) || !voices.length) { wrap.hidden = true; return; }
+  const isGoogle = voiceProvider === "google";
+  const list = isGoogle && voiceLists.google.length ? voiceLists.google : voiceLists.local;
+  if (!list.length) { wrap.hidden = true; return; }
   sel.textContent = "";
-  voices.forEach((v) => {
+  list.forEach((v) => {
     const o = document.createElement("option");
     o.value = v.id;
     o.textContent = v.label || v.id;
     sel.appendChild(o);
   });
-  const ids = voices.map((v) => v.id);
-  const pick = ids.includes(ttsVoice) ? ttsVoice : (ids.includes(fallback) ? fallback : ids[0]);
-  sel.value = pick;
-  ttsVoice = pick;
-  sel.disabled = voiceProvider !== "local";
+  const current = isGoogle ? googleVoice : ttsVoice;
+  if (current) sel.value = current;
+  sel.disabled = !OWN_SOCKET.includes(voiceProvider);
   wrap.hidden = false;
+}
+
+function paintGoogleChoice() {
+  const btn = el("voiceengine") && el("voiceengine").querySelector("button[data-engine='google']");
+  const note = el("googlenote");
+  const off = googleAvailable === false;
+  if (btn) btn.disabled = off;
+  if (note) {
+    note.hidden = !off;
+    note.textContent = off ? "Google isn't set up on this server yet." : "";
+  }
 }
 
 function buildTools(tools) {
@@ -1772,7 +1810,7 @@ function unlockAudio() {
 function releaseAgent() {
   if (!session || !session.session_id) return;
   // A local session has no stored agent to delete -- the models are ours.
-  if (session.provider === "local") return;
+  if (OWN_SOCKET.includes(session.provider)) return;
   const body = new Blob([JSON.stringify({ session_id: session.session_id })], { type: "application/json" });
   try { navigator.sendBeacon("/api/session/end", body); } catch (_) { /* the server sweep catches it */ }
 }
@@ -1880,20 +1918,23 @@ async function start() {
 
   pushContext();
 
-  activeProvider = session.provider === "local" ? "local" : "assemblyai";
+  activeProvider = OWN_SOCKET.includes(session.provider) ? session.provider : "assemblyai";
 
-  if (session.provider === "local") {
-    // Local mode: our own websocket runs STT, routing and TTS on this machine.
-    // Loading the weights is slow the first time, so start that now.
-    warmLocal();
+  if (OWN_SOCKET.includes(session.provider)) {
+    // Local mode runs STT, routing and TTS on the server; Google mode runs
+    // Chirp, Gemini and Chirp HD voices. Same socket protocol either way.
+    // Local weights are slow to load the first time, so start that now.
+    const isGoogle = session.provider === "google";
+    if (!isGoogle) warmLocal();
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const path = session.ws_path || "/ws/voice";
-    const voiceParam = (ttsVoice ? `&voice=${encodeURIComponent(ttsVoice)}` : "")
+    const path = session.ws_path || (isGoogle ? "/ws/voice/google" : "/ws/voice");
+    const voice = isGoogle ? googleVoice : ttsVoice;
+    const voiceParam = (voice ? `&voice=${encodeURIComponent(voice)}` : "")
       + (toolsOff.length ? `&tools_off=${encodeURIComponent(toolsOff.join(","))}` : "");
     ws = new WebSocket(`${proto}//${location.host}${path}?session_id=${encodeURIComponent(session.session_id)}&llm=${encodeURIComponent(answerModel || "gemini")}${voiceParam}`);
     ws.onopen = () => {
-      debug("local voice socket open");
-      setStatus("loading the speech models", "busy");
+      debug((isGoogle ? "google" : "local") + " voice socket open");
+      setStatus(isGoogle ? "connecting to Google Cloud" : "loading the speech models", "busy");
     };
   } else {
     ws = new WebSocket(`${WS_URL}?token=${encodeURIComponent(session.token)}`);
@@ -2182,8 +2223,13 @@ function closeSettings() {
 }
 el("settingsbtn").addEventListener("click", openSettings);
 el("voice").addEventListener("change", (e) => {
-  ttsVoice = e.target.value;
-  storageSet("hark:voice", ttsVoice);
+  if (voiceProvider === "google") {
+    googleVoice = e.target.value;
+    storageSet("hark:googleVoice", googleVoice);
+  } else {
+    ttsVoice = e.target.value;
+    storageSet("hark:voice", ttsVoice);
+  }
 });
 el("settingsclose").addEventListener("click", closeSettings);
 el("settingsscrim").addEventListener("click", closeSettings);

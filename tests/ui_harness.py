@@ -102,6 +102,7 @@ LONG = dict(SINGLE, id="long-book", title="Very Long Book",
 class Handler(http.server.SimpleHTTPRequestHandler):
     books = [SINGLE, MULTI]
     playhead_calls: list = []
+    session_paths: list = []
 
     def log_message(self, *_):      # keep the test output readable
         pass
@@ -147,6 +148,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                                "tts_voices": [{"id": "alba", "label": "Alba"},
                                               {"id": "marius", "label": "Marius"}],
                                "tts_voice_default": "alba",
+                               "google_voice": {"available": True},
+                               "google_tts_voices": [{"id": "Aoede", "label": "Aoede"},
+                                                     {"id": "Charon", "label": "Charon"}],
+                               "google_tts_voice_default": "Aoede",
                                "tools": [
                                    {"id": "passage_at_playhead", "label": "What you just heard",
                                     "description": "Reads the passage at the playhead", "always_on": True},
@@ -159,6 +164,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             if "provider=local" in self.path:
                 return self._send({"provider": "local", "session_id": "s1",
                                    "ws_path": "/ws/voice"})
+            if "provider=google" in self.path:
+                Handler.session_paths.append(self.path)
+                return self._send({"provider": "google", "session_id": "s1",
+                                   "ws_path": "/ws/voice/google"})
             return self._send({"token": "t", "agent_id": "a", "session_id": "s1"})
         return self._send({"detail": "not found"})
 

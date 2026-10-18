@@ -689,7 +689,9 @@
       <div class="choice" id="voiceengine" role="radiogroup" aria-label="Which voice engine answers">
         <button type="button" data-engine="assemblyai" role="radio" aria-checked="true">Cloud<small>AssemblyAI voice agent</small></button>
         <button type="button" data-engine="local" role="radio" aria-checked="false">Local<small>Private: speech runs on the server you use</small></button>
+        <button type="button" data-engine="google" role="radio" aria-checked="false">Google<small>Chirp speech, Gemini, Chirp HD voices</small></button>
       </div>
+      <p class="muted note" id="googlenote" hidden></p>
       <div class="choice" id="llmengine" role="radiogroup" aria-label="Which model writes the answer" style="margin-top:8px" hidden>
         <button type="button" data-llm="gemini" role="radio" aria-checked="true">Gemini<small>Best answers, cloud</small></button>
         <button type="button" data-llm="gemma" role="radio" aria-checked="false">Gemma<small>On-device, offline</small></button>
@@ -703,7 +705,7 @@
     <div class="setting" id="voicewrap" hidden>
       <h3><label for="voice">Voice</label></h3>
       <select id="voice" class="select"></select>
-      <p class="muted note" id="voicenote">Voice applies to the Local engine, from the next time you tap &ldquo;Enable asking questions&rdquo;.</p>
+      <p class="muted note" id="voicenote">Voice applies to the Local and Google engines, from the next time you tap &ldquo;Enable asking questions&rdquo;.</p>
     </div>
 
     <!-- Which tools Hark may reach for. Filled from /api/health; hidden on a

@@ -601,3 +601,29 @@ def test_tools_switched_off_are_remembered_and_sent(page):
     page.wait_for_selector("#toolswrap:not([hidden])")
     assert not page.is_checked("#toollist input[data-tool='web_search']")
 
+
+def test_the_google_engine_uses_its_own_voices_and_socket(page):
+    """All-Google: provider=google, its own socket path, Chirp HD voices saved apart."""
+    Handler.session_paths = []
+    page.click("#settingsbtn")
+    page.wait_for_selector("#voicewrap:not([hidden])")
+    page.click("#voiceengine button[data-engine='google']")
+    assert page.locator("#llmengine").get_attribute("hidden") is not None, \
+        "Google always answers with Gemini; the Gemma choice is Local-only"
+    assert page.is_enabled("#voice")
+    options = page.eval_on_selector_all("#voice option", "os => os.map(o => o.value)")
+    assert options == ["Aoede", "Charon"]
+    page.select_option("#voice", "Charon")
+    page.click("#settingsclose")
+    assert page.evaluate("JSON.parse(localStorage.getItem('hark:googleVoice'))") == "Charon"
+    assert page.evaluate("JSON.parse(localStorage.getItem('hark:voiceprovider'))") == "google"
+
+    page.click("#start")
+    page.wait_for_function("window.__ws !== undefined")
+    url = page.evaluate("window.__ws.url")
+    assert "/ws/voice/google" in url and "voice=Charon" in url
+    assert any("provider=google" in p for p in Handler.session_paths)
+    page.evaluate("window.__agent({type:'session.ready', session_id:'s1'})")
+    page.wait_for_function("live === true")
+    assert "Google Cloud" in page.inner_text("#status")
+
