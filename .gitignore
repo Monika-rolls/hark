@@ -41,3 +41,7 @@ data/podcast-32k.*
 
 # Hackathon submission artwork, branded with the project's old name.
 /submission/
+
+# Local-only titles (audio, index, transcript, catalog entry) that are not ours
+# to redistribute. The Cloud Run build context includes them; git never does.
+/media/

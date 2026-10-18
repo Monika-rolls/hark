@@ -1,0 +1,22 @@
+[
+  {"id": "calculus", "title": "Calculus Made Easy, ch. 3: On Relative Growings",
+   "author": "Silvanus P. Thompson", "kind": "book", "topic": "Math",
+   "audio_url": "/audio/calculus.mp3",
+   "blurb": "How one quantity grows as another does: the idea a derivative is built on.",
+   "source": "LibriVox (public domain)"},
+  {"id": "nasa-dark-side", "title": "Welcome to the Dark Side",
+   "author": "NASA's Curious Universe", "kind": "podcast", "topic": "Space",
+   "audio_url": "/audio/nasa-dark-side.mp3",
+   "blurb": "Dark matter and dark energy, and how the Roman Space Telescope will map them.",
+   "source": "NASA (US government work, public domain)"},
+  {"id": "einstein-relativity", "title": "Relativity, sections 1-3",
+   "author": "Albert Einstein", "kind": "book", "topic": "Physics",
+   "audio_url": "https://archive.org/download/relativity_librivox/relativity_01-03_einstein_64kb.mp3",
+   "blurb": "What it means for a geometric statement to be true, and what a position in space is.",
+   "source": "LibriVox (public domain)"},
+  {"id": "russell-appearance", "title": "The Problems of Philosophy, ch. 1: Appearance and Reality",
+   "author": "Bertrand Russell", "kind": "book", "topic": "Philosophy",
+   "audio_url": "https://archive.org/download/problems_of_philosophy_librivox/problemsofphilosophy_01_russell_64kb.mp3",
+   "blurb": "Is the table really brown? Why what we see and what is there can come apart.",
+   "source": "LibriVox (public domain)"}
+]

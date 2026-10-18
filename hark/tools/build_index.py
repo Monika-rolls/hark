@@ -1,6 +1,10 @@
 """Turn an audiobook file into a timestamp-indexed, embedded library.
 
     python -m hark.tools.build_index audio/chapter1.wav
+    python -m hark.tools.build_index https://archive.org/download/.../ch01.mp3 --name russell-ch1
+
+A URL is transcribed where it is served, so the index's timings match the file
+the player streams. --name sets the id (default: the file's stem).
 
 Transcription is cached to data/<name>.transcript.json -- re-transcribing a
 10-hour book every time you tweak chunking is slow and costs money.
@@ -21,21 +25,21 @@ load_dotenv()
 DATA = Path("data")
 
 
-def transcribe(audio_path: Path, force: bool = False) -> dict:
-    cache = DATA / f"{audio_path.stem}.transcript.json"
+def transcribe(source: str, name: str, force: bool = False) -> dict:
+    cache = DATA / f"{name}.transcript.json"
     if cache.exists() and not force:
         print(f"[index] using cached transcript {cache}")
         return json.loads(cache.read_text(encoding="utf-8"))
 
     aai.settings.api_key = os.environ["ASSEMBLYAI_API_KEY"]
-    print(f"[index] transcribing {audio_path.name} (this takes a while)...")
+    print(f"[index] transcribing {source} (this takes a while)...")
     config = aai.TranscriptionConfig(
         # Ordered fallback list: flagship first, broadly-available model second.
         speech_models=["universal-3-5-pro", "universal-2"],
         punctuate=True,
         format_text=True,
     )
-    t = aai.Transcriber(config=config).transcribe(str(audio_path))
+    t = aai.Transcriber(config=config).transcribe(source)
     if t.status == aai.TranscriptStatus.error:
         raise RuntimeError(t.error)
 
@@ -97,9 +101,11 @@ def main() -> int:
     if len(sys.argv) < 2:
         print(__doc__)
         return 2
-    audio = Path(sys.argv[1])
+    source = sys.argv[1]
     force = "--force" in sys.argv
-    payload = transcribe(audio, force=force)
+    name = (sys.argv[sys.argv.index("--name") + 1] if "--name" in sys.argv
+            else Path(source.split("?")[0]).stem)
+    payload = transcribe(source, name, force=force)
 
     chunks = Library.chunks_from_transcript(payload)
     print(f"[index] {len(chunks)} chunks from {len(payload['paragraphs'])} paragraphs")
@@ -107,13 +113,13 @@ def main() -> int:
         print("[index] nothing to index -- is the audio silent?")
         return 1
 
-    lib = Library(DATA / f"{audio.stem}.db")
+    lib = Library(DATA / f"{name}.db")
     embedder = GeminiEmbedder(os.environ["GEMINI_API_KEY"])
     print(f"[index] embedding {len(chunks)} chunks...")
     lib.build(chunks, embedder)
     print(f"[index] done: {len(lib)} chunks -> {lib.db_path}")
 
-    kt_path = DATA / f"{audio.stem}.keyterms.json"
+    kt_path = DATA / f"{name}.keyterms.json"
     if not kt_path.exists() or force:
         try:
             terms = extract_keyterms(payload, os.environ["GEMINI_API_KEY"])

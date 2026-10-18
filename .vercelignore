@@ -4,6 +4,7 @@
 !.env.example
 # Local-only weights, scratch audio and the Cloud Run image files.
 /models/
+/media/
 /checkpoints/
 /*.mp3
 *.log

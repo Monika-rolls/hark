@@ -250,7 +250,7 @@ answers — verified live with simultaneous listeners.
 | `ASSEMBLYAI_API_KEY` | — | Required. STT, TTS, the agent, and transcription |
 | `GEMINI_API_KEY` | — | Embeddings. Without it, position retrieval still works; topic search does not |
 | `HARK_AGENT_ID` | — | The stored agent, from `scripts/create_agent.py` |
-| `HARK_BOOK` | `calculus` | Which baked-in index to ship as the default book |
+| `HARK_BOOKS` | `calculus` | Built-in titles, comma-separated, first is the default. Metadata in `data/catalog.json`; local-only titles (audio, index, catalog entry) go in the gitignored `media/` and are served from `media/audio/` |
 | `HARK_PUBLIC_URL` | `http://localhost:8000` | Base URL for the tool addresses in each listener's agent |
 | `HARK_ACCESS_CODE` | — | If set, a voice session and adding a book need this code (header `x-access-code`). Listening stays open |
 | `HARK_MAX_UPLOAD_MB` | `4` | Ceiling on a direct file upload |

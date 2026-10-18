@@ -68,7 +68,10 @@ def _setting(name: str, default: str = "") -> str:
     return os.getenv(f"HARK_{name}") or default
 
 
-BOOK = _setting("BOOK", "calculus")
+# The built-in titles, in shelf order; the first is the default. HARK_BOOK is
+# the older single-title form and still works.
+BOOKS = [b.strip() for b in (_setting("BOOKS") or _setting("BOOK", "calculus")).split(",")
+         if b.strip()]
 # Read lazily-tolerant: a missing key should surface as a clear 500 on the
 # one endpoint that needs it, not as an import-time crash that takes the
 # whole function down and reports nothing useful.
@@ -115,7 +118,45 @@ async def _unhandled(request: Request, exc: Exception):
     print(f"[error] {request.url.path}: {type(exc).__name__}: {exc}")
     return JSONResponse(status_code=500,
                         content={"detail": f"{type(exc).__name__}: {exc}"})
-library = Library(ROOT / "data" / f"{BOOK}.db")
+# Built-in indexes live in data/ (committed) or media/ (local-only titles whose
+# audio and transcript must not go in a public repo; the Cloud Run image still
+# carries them).
+MEDIA = ROOT / "media"
+
+
+def _load_catalog() -> Dict[str, dict]:
+    """Per-title metadata: data/catalog.json, then media/catalog.local.json over
+    it, so a local-only title never has to be named in the repo."""
+    out: Dict[str, dict] = {}
+    for path in (ROOT / "data" / "catalog.json", MEDIA / "catalog.local.json"):
+        if not path.exists():
+            continue
+        try:
+            for entry in json.loads(path.read_text(encoding="utf-8")):
+                out[entry["id"]] = entry
+        except Exception as exc:
+            print(f"[catalog] {path.name} unreadable, skipped: {exc}")
+    return out
+
+
+def _open_builtins(ids) -> Dict[str, Library]:
+    """Open each named index. A missing one is skipped with a note rather than
+    taking the server down: a shelf one title short beats no shelf."""
+    out: Dict[str, Library] = {}
+    for book_id in ids:
+        db = next((d / f"{book_id}.db" for d in (ROOT / "data", MEDIA)
+                   if (d / f"{book_id}.db").exists()), None)
+        if db is None:
+            print(f"[books] built-in '{book_id}' has no index; skipped")
+            continue
+        out[book_id] = Library(db)
+    return out
+
+
+CATALOG = _load_catalog()
+BUILTINS = _open_builtins(BOOKS) or _open_builtins(["calculus"])
+BOOK = next(iter(BUILTINS))
+library = BUILTINS[BOOK]
 playheads = build_store()
 # The local model stack. Constructing it loads nothing -- the engine binary and
 # the weights are fetched on first use -- so this is safe on a host (Vercel)
@@ -130,12 +171,12 @@ def library_for(session_id: Optional[str]):
     Redis. Both answer window() and search(), so neither tool below has to know
     which one it is holding.
     """
-    book_id = playheads.get_book(session_id)
-    if not book_id or book_id == BOOK:
-        return library, BOOK
+    book_id = playheads.get_book(session_id) or BOOK
+    if book_id in BUILTINS:
+        return BUILTINS[book_id], _builtin_title(book_id)
     rec = books.load(playheads, book_id)
     if not rec or rec.status != "ready":
-        return library, BOOK
+        return library, _builtin_title(BOOK)
     return books.RedisLibrary(playheads, rec), rec.title
 
 
@@ -940,11 +981,26 @@ def _embedder():
         return None
 
 
-def _builtin_card() -> dict:
-    return {"id": BOOK, "title": _setting("BOOK_TITLE", "Calculus Made Easy, ch. 3"),
-            "audio_url": f"/audio/{BOOK}.mp3", "status": "ready", "error": "",
-            "progress": 100, "chunks": len(library),
-            "duration": round(library.duration_hint(), 1), "builtin": True}
+def _builtin_title(book_id: str) -> str:
+    title = CATALOG.get(book_id, {}).get("title")
+    if title:
+        return title
+    return _setting("BOOK_TITLE", "Calculus Made Easy, ch. 3") if book_id == BOOK else book_id
+
+
+def _builtin_card(book_id: Optional[str] = None) -> dict:
+    """A built-in title as the shelf shows it. kind, author, topic and blurb come
+    from the catalog and are empty for a title it does not describe."""
+    book_id = book_id or BOOK
+    lib = BUILTINS[book_id]
+    meta = CATALOG.get(book_id, {})
+    return {"id": book_id, "title": _builtin_title(book_id),
+            "audio_url": meta.get("audio_url") or f"/audio/{book_id}.mp3",
+            "status": "ready", "error": "", "progress": 100, "chunks": len(lib),
+            "duration": round(lib.duration_hint(), 1), "builtin": True,
+            "kind": meta.get("kind", "book"), "author": meta.get("author", ""),
+            "topic": meta.get("topic", ""), "blurb": meta.get("blurb", ""),
+            "source": meta.get("source", "")}
 
 
 # Public domain narration, so anyone landing on the demo has something real to
@@ -1043,10 +1099,10 @@ def _featured() -> list[dict]:
 
 @app.get("/api/books")
 def list_books(request: Request):
-    """The shipped book, the featured ones, then this browser's own."""
+    """The built-in titles, the featured ones, then this browser's own."""
     mine = books.shelf(playheads, _client_id(request))
     featured = [f for f in _featured() if f["id"] not in {b["id"] for b in mine}]
-    return {"books": [_builtin_card()] + featured + mine,
+    return {"books": [_builtin_card(b) for b in BUILTINS] + featured + mine,
             "suggested": SUGGESTED,
             # The page reads its own ceilings from here rather than hardcoding
             # them, so raising a setting moves the check and the wording with it.
@@ -1151,8 +1207,8 @@ def book_contents(book_id: str):
     An audiobook file carries no structure at all -- it is one opaque stream,
     which is why skipping around is guesswork. The transcript gives it back.
     """
-    if book_id == BOOK:
-        return {"contents": books.contents(library)}
+    if book_id in BUILTINS:
+        return {"contents": books.contents(BUILTINS[book_id])}
     rec = books.load(playheads, book_id)
     if not rec or rec.status != "ready":
         return {"contents": []}
@@ -1176,8 +1232,8 @@ def book_status(book_id: str):
     next hundred chunks, so progress only moves while someone is watching --
     which is exactly when it matters.
     """
-    if book_id == BOOK:
-        return _builtin_card()
+    if book_id in BUILTINS:
+        return _builtin_card(book_id)
     rec = books.load(playheads, book_id)
     if not rec:
         raise HTTPException(404, "No such book.")
@@ -1203,7 +1259,7 @@ def _title_from_url(url: str) -> str:
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "book": BOOK, "chunks": len(library),
+    return {"ok": True, "book": BOOK, "books": list(BUILTINS), "chunks": len(library),
             "agent_configured": bool(AGENT_ID), "store": playheads.kind,
             "access_code": bool(ACCESS_CODE),
             "voice_provider": VOICE_PROVIDER,
@@ -1214,16 +1270,15 @@ def health():
 
 # ---------- static ----------
 
-# The repo ships one copy of the book audio, in public/ (that is what Vercel
-# serves). audio/ is the working directory for building an index and is not
-# committed, so fall back to public/audio for a fresh clone.
-AUDIO = ROOT / "audio"
-if not AUDIO.exists():
-    AUDIO = ROOT / "public" / "audio"
+# Committed audio is in public/audio (that is also what Vercel serves); local-only
+# titles stream from media/audio -- only that subfolder, so their indexes and
+# transcripts are never served. Range requests come free, which is what lets the
+# <audio> element seek.
+AUDIO = ROOT / "public" / "audio"
 if AUDIO.exists():
-    # The browser streams the book from here; range requests come free, which
-    # is what lets the <audio> element seek.
     app.mount("/audio", StaticFiles(directory=str(AUDIO)), name="audio")
+if (MEDIA / "audio").exists():
+    app.mount("/media", StaticFiles(directory=str(MEDIA / "audio")), name="media")
 
 if WEB.exists():
     app.mount("/static", StaticFiles(directory=str(WEB)), name="static")
