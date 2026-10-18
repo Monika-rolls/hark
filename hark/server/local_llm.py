@@ -62,6 +62,31 @@ def _local_model() -> str:
     return os.getenv("HARK_LOCAL_LLM_MODEL", "") or "gemma-3-1b-it"
 
 
+_vertex = None
+
+
+def vertex_client():
+    """Gemini through Vertex AI, when HARK_VERTEX_PROJECT is set; else None.
+
+    An AI Studio free-tier key allows 20 requests a day per model and has no
+    Google Search grounding to speak of -- a demo ran out mid-afternoon. Vertex
+    AI bills the Google Cloud project instead and, on Cloud Run, authenticates
+    as the service account: no key in the container at all.
+    """
+    global _vertex
+    project = os.getenv("HARK_VERTEX_PROJECT", "").strip()
+    if not project:
+        return None
+    if _vertex is None:
+        from google import genai
+        from google.genai import types
+        _vertex = genai.Client(
+            vertexai=True, project=project,
+            location=os.getenv("HARK_VERTEX_LOCATION", "global").strip() or "global",
+            http_options=types.HttpOptions(timeout=30_000))
+    return _vertex
+
+
 class GeminiAnswer:
     """Google's model, over the network. The default."""
 
@@ -73,9 +98,12 @@ class GeminiAnswer:
         self._model = model or os.getenv("HARK_LOCAL_CHAT_MODEL", "") or CHAT_MODEL
 
     def available(self) -> bool:
-        return bool(os.getenv("GEMINI_API_KEY", ""))
+        return bool(os.getenv("HARK_VERTEX_PROJECT", "").strip() or os.getenv("GEMINI_API_KEY", ""))
 
     def _client_or_none(self):
+        vertex = vertex_client()
+        if vertex is not None:
+            return vertex
         key = os.getenv("GEMINI_API_KEY", "")
         if not key:
             return None
@@ -214,27 +242,9 @@ def available_llms() -> dict:
     return {"gemini": GeminiAnswer().available(), "gemma": GemmaAnswer().available()}
 
 
-_search_client = None
-
-
 def _grounding_client():
-    """Vertex AI when HARK_VERTEX_PROJECT is set, else the Gemini API key.
-
-    Grounding with Google Search is metered separately from plain Gemini, and an
-    AI Studio free-tier key may have none of it. On Cloud Run, Vertex AI bills
-    the project and authenticates as the service account -- no key involved.
-    """
-    global _search_client
-    project = os.getenv("HARK_VERTEX_PROJECT", "").strip()
-    if not project:
-        return GeminiAnswer()._client_or_none()
-    if _search_client is None:
-        from google import genai
-        from google.genai import types
-        _search_client = genai.Client(
-            vertexai=True, project=project, http_options=types.HttpOptions(timeout=30_000),
-            location=os.getenv("HARK_VERTEX_LOCATION", "global").strip() or "global")
-    return _search_client
+    """Vertex AI when configured (see vertex_client), else the Gemini API key."""
+    return GeminiAnswer()._client_or_none()
 
 
 def google_search(query: str, context: str = "") -> Optional[dict]:

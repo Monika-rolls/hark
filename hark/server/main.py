@@ -889,10 +889,11 @@ def _embed(query: str):
     """One embedding, or None if embeddings are unavailable."""
     try:
         from hark.core.brain import GeminiEmbedder
+        vertex = local_llm.vertex_client()
         key = os.getenv("GEMINI_API_KEY", "")
-        if not key:
+        if vertex is None and not key:
             return None
-        return GeminiEmbedder(key)([query], "query")[0]
+        return GeminiEmbedder(key or None, client=vertex)([query], "query")[0]
     except Exception as exc:
         print(f"[tool] embed failed: {exc}")
         return None
@@ -1282,8 +1283,11 @@ def _embedder():
     """The Gemini embedder, or None if this deployment has no key."""
     try:
         from hark.core.brain import GeminiEmbedder
+        vertex = local_llm.vertex_client()
         key = os.getenv("GEMINI_API_KEY", "")
-        return GeminiEmbedder(key) if key else None
+        if vertex is None and not key:
+            return None
+        return GeminiEmbedder(key or None, client=vertex)
     except Exception as exc:
         print(f"[books] embedder unavailable: {exc}")
         return None

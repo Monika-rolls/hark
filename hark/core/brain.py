@@ -101,8 +101,10 @@ def is_resume_command(text: str) -> bool:
 
 
 class GeminiEmbedder:
-    def __init__(self, api_key: str, model: str = EMBED_MODEL, dim: int = EMBED_DIM):
-        self._client = genai.Client(api_key=api_key)
+    def __init__(self, api_key: Optional[str] = None, model: str = EMBED_MODEL,
+                 dim: int = EMBED_DIM, client=None):
+        # A ready client (Vertex AI) wins over a key.
+        self._client = client or genai.Client(api_key=api_key)
         self._model = model
         self._dim = dim
 
