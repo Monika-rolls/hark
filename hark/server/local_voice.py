@@ -125,10 +125,15 @@ class Endpointer:
     ):
         # 450 ms of silence ends the turn (was ~1 s, which added a wait to every
         # question). 150 ms of speech opens it. Both are settings.
+        # The attack must be an UNBROKEN run of loud, voiced frames, and speech
+        # dips between syllables: at 280 ms neither "Please quiz me." nor
+        # "Wait, what did he mean by that last part?" nor narration at normal
+        # level ever opened a turn. Noise is rejected by the trigger level,
+        # Silero and the voiced-time floor, not by a long attack.
         if silence_s is None:
             silence_s = float(os.getenv("HARK_STT_SILENCE_MS", "450") or 450) / 1000.0
         if attack_s is None:
-            attack_s = float(os.getenv("HARK_STT_ATTACK_MS", "280") or 280) / 1000.0
+            attack_s = float(os.getenv("HARK_STT_ATTACK_MS", "150") or 150) / 1000.0
         self.rate = rate
         self._ratio = threshold_ratio
         self._min_trigger = min_trigger_rms
